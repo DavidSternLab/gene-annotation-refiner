@@ -1,0 +1,29 @@
+# Large genome/alignment data files
+*.fa
+*.fai
+*.bw
+*.bam
+*.bai
+*.tab
+*.gtf
+*.gff
+*.gff3
+*.gff3.gz
+*.gtf.gz
+*.log
+*.err
+*.out
+
+# Allow test scripts and the main pipeline
+!gene_annotation_refiner_2.py
+!gene_annotation_refiner.py
+!test_022362/*.sh
+!test_run/*.sh
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
