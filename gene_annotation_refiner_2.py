@@ -5420,7 +5420,15 @@ class GeneAnnotationRefiner:
                     # not sufficient evidence.  Sequencing errors or rare
                     # alternative sites can produce canonical GT-AG dinucleotides
                     # at non-functional positions; only junction reads confirm use.
-                    if self.bam_evidence.available:
+                    #
+                    # Exception: TransDecoder support exempts an exon from this
+                    # override.  TransDecoder CDS comes from actual transcript
+                    # sequences (isoseq or assembled), so its exon structure is
+                    # real even when portcullis does not confirm the junctions
+                    # (e.g. because the gene is lowly expressed and portcullis
+                    # filtered out low-count junctions in its reliability pass).
+                    has_td_support = 'TransDecoder' in src_set
+                    if self.bam_evidence.available and not has_td_support:
                         left_reads  = self.bam_evidence.count_spliced_reads(
                             seqid, left_intron[0],  left_intron[1])
                         right_reads = self.bam_evidence.count_spliced_reads(
