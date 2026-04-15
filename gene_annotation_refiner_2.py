@@ -2114,17 +2114,18 @@ def score_acceptor(seq: str) -> float:
 
 
 def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
-                              candidates: set, coverage, genome) -> int:
+                              candidates: set, coverage, genome,
+                              bam_evidence=None) -> int:
     """Choose the best exon boundary position from a set of candidates.
 
-    For each candidate, compute a composite score combining:
-      1. Coverage drop from the exon body into the flanking intron (a sharper
-         drop indicates a real splice boundary, not arbitrary truncation).
-      2. PWM score of the donor (end boundary) or acceptor (start boundary)
-         splice site at that position.
+    Junction reads are the primary discriminator: if any candidate has read
+    support in the junction file, only junction-supported candidates are
+    considered (coverage + PWM break ties among them).  When no candidate
+    has junction reads, the decision falls back to coverage drop + PWM alone.
 
-    Returns the highest-scoring candidate.  If coverage is unavailable or PWMs
-    are not yet trained, falls back to the most conservative (smallest) exon.
+    This prevents a marginally better PWM score from overriding a real splice
+    site that has direct read evidence (e.g. a 4 bp shift caused by a nearby
+    canonical dinucleotide that is never actually used).
 
     Parameters
     ----------
@@ -2133,6 +2134,8 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
         'end' → right edge (donor site).
     candidates : set of int
         The boundary positions proposed by the different annotation sources.
+    bam_evidence : junction evidence object, optional
+        Provides reads_at_donor / reads_at_acceptor queries.
     """
     if len(candidates) == 1:
         return next(iter(candidates))
@@ -2140,20 +2143,44 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
     FLANK = 20        # bp of intron to measure for the coverage drop
     BODY  = 50        # bp of exon body to use as baseline coverage
 
+    # On + strand: exon end = donor, exon start = acceptor.
+    # On - strand: exon end = acceptor, exon start = donor.
+    end_is_donor = (strand == '+')
+
+    # ── Step 1: query junction read counts for each candidate ──────────────
+    junction_reads: dict = {}
+    if bam_evidence is not None and getattr(bam_evidence, 'available', False):
+        for pos in candidates:
+            if which == 'end':
+                reads = (bam_evidence.reads_at_donor(seqid, pos)
+                         if end_is_donor else
+                         bam_evidence.reads_at_acceptor(seqid, pos))
+            else:
+                reads = (bam_evidence.reads_at_acceptor(seqid, pos)
+                         if end_is_donor else
+                         bam_evidence.reads_at_donor(seqid, pos))
+            junction_reads[pos] = reads
+
+    max_junction_reads = max(junction_reads.values()) if junction_reads else 0
+
+    # If any candidate has junction support, restrict to those candidates.
+    # This makes junction evidence the authoritative tie-breaker: a real splice
+    # site backed by RNA-seq reads always beats a better-looking PWM at an
+    # unsupported position.
+    if max_junction_reads > 0:
+        active_candidates = {p for p, r in junction_reads.items() if r > 0}
+    else:
+        active_candidates = set(candidates)
+
+    # Start from the most conservative (smallest) position as baseline.
+    if which == 'start':
+        sorted_candidates = sorted(active_candidates)
+    else:
+        sorted_candidates = sorted(active_candidates, reverse=True)
+
+    # ── Step 2: score by coverage drop + PWM (tiebreaker) ──────────────────
     best_pos = None
     best_score = None
-
-    # Start from the smallest exon (most conservative) as baseline so we only
-    # expand when evidence supports it.
-    if which == 'start':
-        sorted_candidates = sorted(candidates)        # smallest = most 5'
-    else:
-        sorted_candidates = sorted(candidates, reverse=True)  # largest = most 3'
-
-    # On + strand: exon end = donor, exon start = acceptor.
-    # On - strand: exon end = acceptor (intron is to the left on the genome),
-    #              exon start = donor.  Map accordingly.
-    end_is_donor = (strand == '+')
 
     for pos in sorted_candidates:
         if which == 'end':
@@ -2186,18 +2213,12 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
         body_cov   = coverage.get_mean_coverage(seqid, body_start, body_end)
         intron_cov = coverage.get_mean_coverage(seqid, intron_start, intron_end)
 
-        # Coverage drop score: 1.0 = perfect drop to zero, 0.0 = no drop.
-        # Normalise against body coverage; if body has no coverage, drop score
-        # contributes nothing (PWM score alone decides).
         if body_cov > 0.5:
             drop_score = max(0.0, 1.0 - intron_cov / body_cov)
         else:
-            drop_score = 0.5  # neutral when there is no usable coverage
+            drop_score = 0.5
 
-        # Normalise PWM score to [0, 1] range with a soft sigmoid.
-        # Typical strong donor/acceptor scores ~5–10; weak ~0–2.
-        pwm_norm = 1.0 / (1.0 + 2.0 ** (-pwm_score))
-
+        pwm_norm  = 1.0 / (1.0 + 2.0 ** (-pwm_score))
         composite = 0.6 * drop_score + 0.4 * pwm_norm
 
         if best_score is None or composite > best_score:
@@ -3305,6 +3326,26 @@ class SplicedReadEvidence:
         """Check if at least min_reads support this splice junction."""
         return self.count_spliced_reads(seqid, intron_start, intron_end) >= min_reads
 
+    def reads_at_donor(self, seqid: str, donor_pos: int, tolerance: int = 5) -> int:
+        """Max read count for any junction starting at donor_pos+1 (±tolerance)."""
+        intron_start = donor_pos + 1
+        best = 0
+        for js, _, jc in self.find_novel_junctions(
+                seqid, donor_pos - tolerance, donor_pos + tolerance + 1, min_reads=1):
+            if abs(js - intron_start) <= tolerance:
+                best = max(best, jc)
+        return best
+
+    def reads_at_acceptor(self, seqid: str, acceptor_pos: int, tolerance: int = 5) -> int:
+        """Max read count for any junction ending at acceptor_pos-1 (±tolerance)."""
+        intron_end = acceptor_pos - 1
+        best = 0
+        for _, je, jc in self.find_novel_junctions(
+                seqid, acceptor_pos - 200000, acceptor_pos + tolerance, min_reads=1):
+            if abs(je - intron_end) <= tolerance:
+                best = max(best, jc)
+        return best
+
     def find_novel_junctions(self, seqid: str, start: int, end: int,
                               min_reads: int = 3) -> List[Tuple[int, int, int]]:
         """Find all splice junctions in a region supported by at least min_reads.
@@ -3554,6 +3595,43 @@ class JunctionFileEvidence:
                              min_reads: int = 2) -> bool:
         return self.count_spliced_reads(seqid, intron_start, intron_end) >= min_reads
 
+    def reads_at_donor(self, seqid: str, donor_pos: int, tolerance: int = 5) -> int:
+        """Max read count for any junction whose intron starts at donor_pos+1 (±tolerance)."""
+        import bisect
+        junctions_on_seq = self._by_seqid.get(seqid, [])
+        if not junctions_on_seq:
+            return 0
+        intron_start = donor_pos + 1
+        idx = bisect.bisect_left(junctions_on_seq, (intron_start - tolerance, 0, 0))
+        best = 0
+        while idx < len(junctions_on_seq):
+            j_start, _, j_count = junctions_on_seq[idx]
+            if j_start > intron_start + tolerance:
+                break
+            if abs(j_start - intron_start) <= tolerance:
+                best = max(best, j_count)
+            idx += 1
+        return best
+
+    def reads_at_acceptor(self, seqid: str, acceptor_pos: int, tolerance: int = 5) -> int:
+        """Max read count for any junction whose intron ends at acceptor_pos-1 (±tolerance)."""
+        import bisect
+        junctions_on_seq = self._by_seqid.get(seqid, [])
+        if not junctions_on_seq:
+            return 0
+        intron_end = acceptor_pos - 1
+        # Scan junctions starting up to ~200 kb before to find any ending here
+        idx = bisect.bisect_left(junctions_on_seq, (intron_end - 200000, 0, 0))
+        best = 0
+        while idx < len(junctions_on_seq):
+            j_start, j_end, j_count = junctions_on_seq[idx]
+            if j_start > intron_end + tolerance:
+                break
+            if abs(j_end - intron_end) <= tolerance:
+                best = max(best, j_count)
+            idx += 1
+        return best
+
     def find_novel_junctions(self, seqid: str, start: int, end: int,
                               min_reads: int = 3) -> List[Tuple[int, int, int]]:
         """Find all junctions in a region using binary search on sorted list."""
@@ -3600,6 +3678,12 @@ class NoBAMEvidence:
 
     def has_junction_support(self, *args, **kwargs):
         return False
+
+    def reads_at_donor(self, *_args, **_kwargs):
+        return 0
+
+    def reads_at_acceptor(self, *_args, **_kwargs):
+        return 0
 
     def find_novel_junctions(self, *args, **kwargs):
         return []
@@ -5022,11 +5106,13 @@ class GeneAnnotationRefiner:
                         best_start = _pick_best_exon_boundary(
                             seqid, strand, 'start',
                             {m[0], start},
-                            self.coverage, self.genome)
+                            self.coverage, self.genome,
+                            self.bam_evidence)
                         best_end = _pick_best_exon_boundary(
                             seqid, strand, 'end',
                             {m[1], end},
-                            self.coverage, self.genome)
+                            self.coverage, self.genome,
+                            self.bam_evidence)
                         m[0], m[1] = best_start, best_end
                         placed = True
                         break
@@ -5640,7 +5726,7 @@ class GeneAnnotationRefiner:
         selected = []
         occupied = defaultdict(list)  # (seqid, strand) -> [(start, end)]
 
-        for score, gene in assembled_genes:
+        for _, gene in assembled_genes:
             key = (gene.seqid, gene.strand)
             overlaps_selected = False
 
