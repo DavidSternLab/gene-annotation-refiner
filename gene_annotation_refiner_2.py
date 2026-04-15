@@ -1536,6 +1536,13 @@ class ORFFinder:
                 if orf_len >= min_orf_len:
                     candidates.append((i, seq_len, frame))
 
+        # If no ORF meets the requested minimum length, retry with a shorter
+        # floor (75 bp = 25 aa).  This handles genuinely short proteins whose
+        # only ATG produces an ORF below the default 150 bp threshold.
+        if not candidates and min_orf_len > 75:
+            return self.find_best_orf(seqid, exons, strand,
+                                      min_orf_len=75, coverage=coverage)
+
         if not candidates:
             return None
 
@@ -5315,7 +5322,15 @@ class GeneAnnotationRefiner:
             # floor that rejects noise transcripts like STRG.12310 whose
             # introns have zero junction reads.
             # Single-exon templates are always accepted (no introns to check).
-            if self.bam_evidence.available:
+            #
+            # TransDecoder templates are EXEMPT from this filter.  Their exon
+            # structure comes from actual transcript sequences (isoseq or
+            # assembled transcriptomes), not from an RNA-seq assembler.  The
+            # portcullis junction file is derived from short-read alignments
+            # and may not confirm isoseq-derived introns even when the splice
+            # sites are real (e.g. different mapping tolerances, tissue
+            # specificity, or low coverage in the short-read library).
+            if self.bam_evidence.available and source_label != 'TransDecoder':
                 introns = list(best_tx.introns())
                 if introns:
                     counts = [
