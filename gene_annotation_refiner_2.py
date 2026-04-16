@@ -2214,17 +2214,22 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
     end_is_donor = (strand == '+')
 
     # ── Step 1: query junction read counts for each candidate ──────────────
+    # Use tolerance=0 (exact match) so that read counts don't bleed between
+    # nearby candidates.  When two candidates are only a few bp apart (e.g. a
+    # GC-AG donor at position X and a GT-AG donor at X+4), a fuzzy window of
+    # ±5 bp would attribute the same reads to both, neutralising the junction
+    # signal and letting PWM (which favours GT) break the tie incorrectly.
     junction_reads: dict = {}
     if bam_evidence is not None and getattr(bam_evidence, 'available', False):
         for pos in candidates:
             if which == 'end':
-                reads = (bam_evidence.reads_at_donor(seqid, pos)
+                reads = (bam_evidence.reads_at_donor(seqid, pos, tolerance=0)
                          if end_is_donor else
-                         bam_evidence.reads_at_acceptor(seqid, pos))
+                         bam_evidence.reads_at_acceptor(seqid, pos, tolerance=0))
             else:
-                reads = (bam_evidence.reads_at_acceptor(seqid, pos)
+                reads = (bam_evidence.reads_at_acceptor(seqid, pos, tolerance=0)
                          if end_is_donor else
-                         bam_evidence.reads_at_donor(seqid, pos))
+                         bam_evidence.reads_at_donor(seqid, pos, tolerance=0))
             junction_reads[pos] = reads
 
     max_junction_reads = max(junction_reads.values()) if junction_reads else 0
