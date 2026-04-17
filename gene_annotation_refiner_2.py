@@ -2358,12 +2358,14 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
     if bam_evidence is not None and getattr(bam_evidence, 'available', False):
         for pos in candidates:
             if which == 'end':
-                # exon.end: intron is to the RIGHT on + strand (donor), to the LEFT on - strand (acceptor)
-                reads = (bam_evidence.reads_at_donor(seqid, pos, tolerance=0)
-                         if end_is_donor else
-                         bam_evidence.reads_at_acceptor(seqid, pos, tolerance=0))
+                # The intron to the RIGHT of exon.end always starts at pos+1,
+                # regardless of strand.  reads_at_donor(pos) finds junctions
+                # with intron_start = pos+1.
+                reads = bam_evidence.reads_at_donor(seqid, pos, tolerance=0)
             else:
-                # exon.start: intron is always to the LEFT (j_end = pos-1) regardless of strand
+                # The intron to the LEFT of exon.start always ends at pos-1,
+                # regardless of strand.  reads_at_acceptor(pos) finds junctions
+                # with intron_end = pos-1.
                 reads = bam_evidence.reads_at_acceptor(seqid, pos, tolerance=0)
             junction_reads[pos] = reads
 
@@ -2395,12 +2397,16 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
             intron_start = pos + 1
             intron_end   = pos + FLANK
             if end_is_donor:
+                # + strand exon.end = donor in transcript direction.
+                # PWM trained on plus-strand window [pos-DONOR_EXON_BP+1, pos+DONOR_INTRON_BP].
                 ss_seq    = genome.get_sequence(
                     seqid, pos - DONOR_EXON_BP + 1, pos + DONOR_INTRON_BP)
                 pwm_score = score_donor(ss_seq)
             else:
-                ss_seq    = genome.get_sequence(
-                    seqid, pos - ACCEPTOR_INTRON_BP, pos + ACCEPTOR_EXON_BP - 1)
+                # − strand exon.end = acceptor in transcript direction.
+                # PWM trained on RC([pos-DONOR_EXON_BP+1, pos+DONOR_INTRON_BP]).
+                ss_seq    = reverse_complement(genome.get_sequence(
+                    seqid, pos - DONOR_EXON_BP + 1, pos + DONOR_INTRON_BP))
                 pwm_score = score_acceptor(ss_seq)
         else:
             intron_start = max(1, pos - FLANK)
@@ -2408,12 +2414,16 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
             body_start   = pos
             body_end     = pos + BODY
             if end_is_donor:
+                # + strand exon.start = acceptor in transcript direction.
+                # PWM trained on plus-strand window [pos-ACCEPTOR_INTRON_BP, pos+ACCEPTOR_EXON_BP-1].
                 ss_seq    = genome.get_sequence(
                     seqid, pos - ACCEPTOR_INTRON_BP, pos + ACCEPTOR_EXON_BP - 1)
                 pwm_score = score_acceptor(ss_seq)
             else:
-                ss_seq    = genome.get_sequence(
-                    seqid, pos - DONOR_EXON_BP + 1, pos + DONOR_INTRON_BP)
+                # − strand exon.start = donor in transcript direction.
+                # PWM trained on RC([pos-ACCEPTOR_INTRON_BP, pos+ACCEPTOR_EXON_BP-1]).
+                ss_seq    = reverse_complement(genome.get_sequence(
+                    seqid, pos - ACCEPTOR_INTRON_BP, pos + ACCEPTOR_EXON_BP - 1))
                 pwm_score = score_donor(ss_seq)
 
         body_cov   = coverage.get_mean_coverage(seqid, body_start, body_end)
@@ -4010,9 +4020,12 @@ class SpliceSiteEvaluator:
 
         intron_ratio = intron_cov / avg_exon_cov
 
-        # Check splice site quality
-        donor_seq = self.genome.get_splice_donor(gene.seqid, first_exon.end, gene.strand)
-        acceptor_seq = self.genome.get_splice_acceptor(gene.seqid, second_exon.start, gene.strand)
+        # Check splice site quality.
+        # Use intron_start/intron_end (already strand-correct) rather than
+        # first_exon.end / second_exon.start, which point to outer exon
+        # boundaries for minus-strand genes and are not adjacent to the intron.
+        donor_seq = self.genome.get_splice_donor(gene.seqid, intron_start - 1, gene.strand)
+        acceptor_seq = self.genome.get_splice_acceptor(gene.seqid, intron_end + 1, gene.strand)
 
         donor_s = score_donor(donor_seq) if len(donor_seq) == DONOR_LEN else -5.0
         acceptor_s = score_acceptor(acceptor_seq) if len(acceptor_seq) == ACCEPTOR_LEN else -5.0
@@ -5382,10 +5395,11 @@ class GeneAnnotationRefiner:
             return max(1.0, covs[p10_idx])
 
         def _max_search_window(exons_list: list) -> int:
-            """Compute a downstream search cap: 2× max intron length in the gene.
+            """Compute a downstream search cap from intron lengths in the gene.
 
-            Prevents the exon-start lookup from jumping to a junction that
-            belongs to a completely different gene far upstream/downstream.
+            Returns the median intron length (floor 2 kb) to prevent the
+            exon-start lookup from jumping to a junction that belongs to a
+            completely different gene far upstream/downstream.
             Falls back to 20 kb if the gene has no introns.
             """
             if len(exons_list) < 2:
