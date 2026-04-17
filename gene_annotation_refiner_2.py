@@ -100,6 +100,10 @@ class EvidenceIndex:
         # Consecutive exon pair index for chimeric detection:
         # (seqid, strand) -> set of (e1_start, e1_end, e2_start, e2_end)
         self._exon_pairs = defaultdict(set)
+        # CDS start positions: (seqid, strand) -> sorted list of (genomic_pos, source_label)
+        # For + strand: start of first CDS segment.  For - strand: end of last CDS segment.
+        # These are the genomic positions of the translation initiation codon.
+        self._cds_starts = defaultdict(list)
         self._built = False
 
     def add_genes(self, genes: List['Gene'], source_label: str):
@@ -113,6 +117,14 @@ class EvidenceIndex:
                 # Add CDS as exon evidence too
                 for cds in tx.cds:
                     self._exons[key].append((cds.start, cds.end, source_label))
+                # Record CDS start (translation initiation site)
+                if tx.cds:
+                    sorted_cds = sorted(tx.cds, key=lambda c: c.start)
+                    if gene.strand == '+':
+                        cds_start_pos = sorted_cds[0].start
+                    else:
+                        cds_start_pos = sorted_cds[-1].end
+                    self._cds_starts[key].append((cds_start_pos, source_label))
                 # Derive introns from consecutive exons
                 for i in range(len(sorted_exons) - 1):
                     intron_start = sorted_exons[i].end + 1
@@ -131,6 +143,8 @@ class EvidenceIndex:
             self._exons[key].sort()
         for key in self._introns:
             self._introns[key].sort()
+        for key in self._cds_starts:
+            self._cds_starts[key].sort()
         self._built = True
         n_exons = sum(len(v) for v in self._exons.values())
         n_introns = sum(len(v) for v in self._introns.values())
@@ -262,6 +276,45 @@ class EvidenceIndex:
             if exon_start <= es and exon_end >= ee and (ee - es + 1) > 10:
                 return True
         return False
+
+    def get_evidence_cds_starts(self, seqid: str, strand: str,
+                                 region_start: int, region_end: int,
+                                 tolerance: int = 10) -> Dict[int, int]:
+        """Return evidence CDS start positions within a genomic region.
+
+        Returns a dict mapping genomic_position -> number of independent
+        evidence sources that place a translation start there.  Positions
+        within `tolerance` of each other are merged (the position with more
+        sources wins).
+
+        For + strand, CDS start = leftmost CDS position (ATG genomic start).
+        For - strand, CDS start = rightmost CDS position (ATG genomic end).
+        """
+        import bisect
+        key = (seqid, strand)
+        cds_list = self._cds_starts.get(key, [])
+        if not cds_list:
+            return {}
+
+        idx = bisect.bisect_left(cds_list, (region_start - tolerance,))
+        raw: Dict[int, set] = {}
+        while idx < len(cds_list):
+            pos, src = cds_list[idx]
+            if pos > region_end + tolerance:
+                break
+            if region_start - tolerance <= pos <= region_end + tolerance:
+                # Merge nearby positions
+                merged = False
+                for existing_pos in list(raw.keys()):
+                    if abs(pos - existing_pos) <= tolerance:
+                        raw[existing_pos].add(src)
+                        merged = True
+                        break
+                if not merged:
+                    raw[pos] = {src}
+            idx += 1
+
+        return {pos: len(srcs) for pos, srcs in raw.items()}
 
 # ============================================================================
 # Logging setup
@@ -1590,29 +1643,33 @@ class ORFFinder:
     def find_best_orf(self, seqid: str, exons: List[Feature],
                       strand: str,
                       min_orf_len: int = 150,
-                      coverage=None) -> Optional[Tuple[int, int, int]]:
+                      coverage=None,
+                      evidence_cds_starts: Dict[int, int] = None) -> Optional[Tuple[int, int, int]]:
         """Find the best ORF in a transcript.
 
-        Strategy: find the earliest ATG (in transcript coordinates, scanning
-        all three frames) that produces an ORF at least min_orf_len bp long,
-        subject to coverage support at the ATG position.
+        Selection priority (highest to lowest):
+          1. Evidence-supported start: ATG maps to a CDS start position
+             from Helixer/TransDecoder/etc.  More sources = higher rank.
+          2. Exon span: ORFs that cover most of the exons are preferred.
+             Real CDS typically starts in the first 1-3 exons and ends in
+             the last 1-3 exons.  A short ORF confined to one exon while
+             7 others become UTR is almost certainly wrong.
+          3. ORF length: among equally-ranked candidates, the longest ORF
+             wins (most likely to be the real protein).
 
-        When coverage is provided, ATG candidates with very low coverage at
-        their genomic start position (< COV_MIN_FRACTION of the
-        best-covered candidate) are excluded.  This prevents a spurious early
-        ATG in a poorly expressed / low-coverage region from being preferred
-        over the real translation start site that has strong RNA-seq support.
+        Parameters
+        ----------
+        coverage : CoverageAccess, optional
+            RNA-seq coverage for ATG filtering.
+        evidence_cds_starts : dict, optional
+            Mapping of genomic CDS start position -> number of evidence
+            sources supporting it.  Obtained from EvidenceIndex.
 
-        Among the coverage-passing candidates, the earliest start is chosen
-        (longest ORF as tiebreaker).
-
-        Returns (orf_start, orf_end, frame) in 0-based transcript coordinates,
-        or None. orf_end is the position after the last base of the stop codon
-        (or transcript end for partial ORFs).
+        Returns (orf_start, orf_end, frame) in 0-based transcript
+        coordinates, or None.
         """
-        # Fraction of the best-covered ATG below which a start is excluded.
-        COV_MIN_FRACTION = 0.10   # < 10% of best → filter out
-        COV_WINDOW = 30           # bp window around the ATG for coverage query
+        COV_MIN_FRACTION = 0.10
+        COV_WINDOW = 30
 
         tx_seq = self._extract_transcript_sequence(seqid, exons, strand)
         if not tx_seq or len(tx_seq) < 3:
@@ -1639,21 +1696,19 @@ class ORFFinder:
                 if orf_len >= min_orf_len:
                     candidates.append((i, seq_len, frame))
 
-        # If no ORF meets the requested minimum length, retry with a shorter
-        # floor (75 bp = 25 aa).  This handles genuinely short proteins whose
-        # only ATG produces an ORF below the default 150 bp threshold.
         if not candidates and min_orf_len > 75:
             return self.find_best_orf(seqid, exons, strand,
-                                      min_orf_len=75, coverage=coverage)
+                                      min_orf_len=75, coverage=coverage,
+                                      evidence_cds_starts=evidence_cds_starts)
 
         if not candidates:
             return None
 
+        sorted_exons_fwd = sorted(exons, key=lambda e: e.start)
+        n_exons = len(sorted_exons_fwd)
+
         # ── Coverage filter ────────────────────────────────────────────────
-        # If coverage is available, compute it at the genomic position of each
-        # ATG and exclude starts that are in very low-coverage regions.
         if coverage is not None and getattr(coverage, 'available', True):
-            sorted_exons_fwd = sorted(exons, key=lambda e: e.start)
             cov_scores = {}
             for orf_start, _, _ in candidates:
                 g_pos = self._tx_pos_to_genomic(
@@ -1675,8 +1730,54 @@ class ORFFinder:
         if not candidates:
             return None
 
-        # Sort by: (1) earliest start position, (2) longest ORF as tiebreaker
-        candidates.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+        # ── Evidence match ─────────────────────────────────────────────────
+        # Check if each candidate's ATG maps to a known evidence CDS start.
+        EVIDENCE_TOL = 10  # bp tolerance for matching ATG to evidence start
+        evidence_match = {}  # orf_start -> n_sources (0 = no match)
+        if evidence_cds_starts:
+            for orf_start, _, _ in candidates:
+                g_pos = self._tx_pos_to_genomic(
+                    orf_start, sorted_exons_fwd, strand)
+                if g_pos is None:
+                    evidence_match[orf_start] = 0
+                    continue
+                best_n = 0
+                for ev_pos, n_srcs in evidence_cds_starts.items():
+                    if abs(g_pos - ev_pos) <= EVIDENCE_TOL:
+                        best_n = max(best_n, n_srcs)
+                evidence_match[orf_start] = best_n
+
+        # ── Exon span ─────────────────────────────────────────────────────
+        # Compute what fraction of exons each ORF's CDS would cover.
+        # An ORF that spans 7/8 exons is almost certainly better than one
+        # confined to 1/8.  We compute this by mapping orf_start and
+        # orf_end back to genomic coords and counting covered exons.
+        def _exon_span_fraction(orf_start: int, orf_end: int) -> float:
+            if n_exons <= 1:
+                return 1.0
+            g_start = self._tx_pos_to_genomic(
+                orf_start, sorted_exons_fwd, strand)
+            # orf_end is 1 past the last base; map orf_end-1 for the last CDS base
+            g_end = self._tx_pos_to_genomic(
+                max(0, orf_end - 1), sorted_exons_fwd, strand)
+            if g_start is None or g_end is None:
+                return 0.0
+            cds_lo = min(g_start, g_end)
+            cds_hi = max(g_start, g_end)
+            covered = sum(1 for e in sorted_exons_fwd
+                          if e.end >= cds_lo and e.start <= cds_hi)
+            return covered / n_exons
+
+        # ── Rank candidates ────────────────────────────────────────────────
+        # Sort key: (evidence_sources DESC, exon_span DESC, orf_length DESC)
+        def sort_key(c):
+            orf_start, orf_end, _ = c
+            ev = evidence_match.get(orf_start, 0)
+            span = _exon_span_fraction(orf_start, orf_end)
+            length = orf_end - orf_start
+            return (-ev, -span, -length)
+
+        candidates.sort(key=sort_key)
         return candidates[0]
 
     def _tx_pos_to_genomic(self, tx_pos: int,
@@ -1758,14 +1859,23 @@ class ORFFinder:
 
         return cds_features
 
-    def reassign_cds(self, gene: 'Gene', coverage=None) -> 'Gene':
+    def reassign_cds(self, gene: 'Gene', coverage=None,
+                     evidence_index: 'EvidenceIndex' = None) -> 'Gene':
         """Re-derive CDS for all transcripts by finding the best ORF."""
         for tx in gene.transcripts:
             if not tx.exons:
                 continue
 
+            # Query evidence CDS starts in the gene region
+            ev_cds_starts = None
+            if evidence_index is not None:
+                ev_cds_starts = evidence_index.get_evidence_cds_starts(
+                    gene.seqid, gene.strand,
+                    gene.start, gene.end)
+
             orf = self.find_best_orf(gene.seqid, tx.exons, gene.strand,
-                                     coverage=coverage)
+                                     coverage=coverage,
+                                     evidence_cds_starts=ev_cds_starts)
             if orf is None:
                 tx.cds = []
                 continue
@@ -4559,7 +4669,8 @@ class GeneAnnotationRefiner:
         for gene in consensus_genes:
             if gene.attributes.get('manual_annotation') == 'true':
                 continue
-            gene = orf_finder.reassign_cds(gene, coverage=self.coverage)
+            gene = orf_finder.reassign_cds(gene, coverage=self.coverage,
+                                          evidence_index=self.evidence_index)
 
         # Step 5g.5: Recover downstream exons for genes lacking a stop codon.
         # Now that CDS has been assigned (step 5g), we can detect stop-codon-free genes.
@@ -4573,7 +4684,8 @@ class GeneAnnotationRefiner:
             if gene.attributes.get('manual_annotation') == 'true':
                 continue
             if gene.attributes.get('_downstream_recovered'):
-                gene = orf_finder.reassign_cds(gene, coverage=self.coverage)
+                gene = orf_finder.reassign_cds(gene, coverage=self.coverage,
+                                              evidence_index=self.evidence_index)
 
         # Step 5h: Split genes where isoforms have non-overlapping CDS
         logger.info("\nStep 5h: Splitting genes with non-overlapping CDS...")
@@ -5698,9 +5810,12 @@ class GeneAnnotationRefiner:
                     # Check if we now have a stop codon
                     test_exons = sorted_exons + new_exons
                     # Quick stop codon check via find_best_orf on extended set
+                    ev_starts = self.evidence_index.get_evidence_cds_starts(
+                        seqid, strand, gene.start, gene.end)
                     test_orf = orf_finder.find_best_orf(
                         seqid, test_exons, strand,
-                        coverage=self.coverage)
+                        coverage=self.coverage,
+                        evidence_cds_starts=ev_starts)
                     if test_orf is not None:
                         new_cds_list = orf_finder.orf_to_genomic_cds(
                             seqid, test_exons, strand,
@@ -6514,8 +6629,11 @@ class GeneAnnotationRefiner:
 
                 if (cds_starts_early and cds_ends_late) or cds_starts_late:
                     orf_finder = ORFFinder(self.genome)
+                    ev_starts = self.evidence_index.get_evidence_cds_starts(
+                        seqid, strand, cgene.start, cgene.end)
                     orf = orf_finder.find_best_orf(seqid, gene_exons, strand,
-                                                   coverage=self.coverage)
+                                                   coverage=self.coverage,
+                                                   evidence_cds_starts=ev_starts)
                     if orf:
                         orf_start, orf_end, _ = orf
                         new_cds = orf_finder.orf_to_genomic_cds(
@@ -6828,9 +6946,12 @@ class GeneAnnotationRefiner:
         if helixer_exons:
             candidates.append(helixer_exons)
 
+        ev_starts = self.evidence_index.get_evidence_cds_starts(
+            gene.seqid, gene.strand, gene.start, gene.end)
         unsplit_orf_len = 0
         for exon_set in candidates:
-            orf = orf_finder.find_best_orf(gene.seqid, exon_set, gene.strand)
+            orf = orf_finder.find_best_orf(gene.seqid, exon_set, gene.strand,
+                                           evidence_cds_starts=ev_starts)
             if orf:
                 unsplit_orf_len = max(unsplit_orf_len, orf[1] - orf[0])
 
@@ -6839,12 +6960,15 @@ class GeneAnnotationRefiner:
         for ci, cluster in enumerate(clusters):
             cl_start = min(g.start for g in cluster)
             cl_end = max(g.end for g in cluster)
+            cl_ev_starts = self.evidence_index.get_evidence_cds_starts(
+                gene.seqid, gene.strand, cl_start, cl_end)
             # Try both consensus exons and Helixer exons for each cluster
             for exon_set in candidates:
                 cluster_exons = [e for e in exon_set
                                 if e.start >= cl_start - 100 and e.end <= cl_end + 100]
                 if cluster_exons:
-                    cluster_orf = orf_finder.find_best_orf(gene.seqid, cluster_exons, gene.strand)
+                    cluster_orf = orf_finder.find_best_orf(gene.seqid, cluster_exons, gene.strand,
+                                                           evidence_cds_starts=cl_ev_starts)
                     if cluster_orf:
                         split_max_orf = max(split_max_orf, cluster_orf[1] - cluster_orf[0])
 
