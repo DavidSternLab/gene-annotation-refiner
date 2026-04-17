@@ -2625,8 +2625,16 @@ class PosteriorCalculator:
         scores = {}
 
         # 1. Splice site sequence score
-        donor_seq = self.genome.get_splice_donor(seqid, intron_start - 1, strand)
-        acceptor_seq = self.genome.get_splice_acceptor(seqid, intron_end + 1, strand)
+        # On + strand: donor at left side (intron_start-1 = exon_left.end),
+        #              acceptor at right side (intron_end+1 = exon_right.start).
+        # On - strand: donor at right side (intron_end+1 = exon_right.start),
+        #              acceptor at left side (intron_start-1 = exon_left.end).
+        if strand == '+':
+            donor_seq = self.genome.get_splice_donor(seqid, intron_start - 1, strand)
+            acceptor_seq = self.genome.get_splice_acceptor(seqid, intron_end + 1, strand)
+        else:
+            donor_seq = self.genome.get_splice_donor(seqid, intron_end + 1, strand)
+            acceptor_seq = self.genome.get_splice_acceptor(seqid, intron_start - 1, strand)
         donor_score = score_donor(donor_seq) if len(donor_seq) == DONOR_LEN else -5.0
         acceptor_score = score_acceptor(acceptor_seq) if len(acceptor_seq) == ACCEPTOR_LEN else -5.0
 
@@ -2862,18 +2870,21 @@ class GeneMerger:
         if gene_a.seqid != gene_b.seqid:
             return False
 
-        # Ensure A is upstream of B
+        # gene_a is always left of gene_b in genomic coordinates (caller
+        # iterates sorted genes).  Check non-overlap in genomic order.
+        if gene_a.end >= gene_b.start:
+            return False  # Overlapping, not adjacent
+
+        # Upstream/downstream in transcript direction
         if gene_a.strand == '+':
-            if gene_a.end >= gene_b.start:
-                return False  # Overlapping, not adjacent
             upstream, downstream = gene_a, gene_b
         else:
-            if gene_b.end >= gene_a.start:
-                return False
             upstream, downstream = gene_b, gene_a
 
-        gap_start = upstream.end + 1
-        gap_end = downstream.start - 1
+        # Gap is always between the left gene's end and right gene's start
+        # (genomic order, regardless of strand).
+        gap_start = gene_a.end + 1
+        gap_end = gene_b.start - 1
         gap_size = gap_end - gap_start + 1
 
         if gap_size <= 0 or gap_size > 50000:
@@ -2893,13 +2904,20 @@ class GeneMerger:
                 logger.debug(f"Merge evidence: {upstream.gene_id} lacks stop codon")
 
         # Check 2: Does the upstream gene end with a splice donor site?
+        # For + strand the 3' terminal exon is exons[-1] and the donor
+        # boundary is at exon.end.  For - strand the 3' terminal exon is
+        # exons[0] and the donor boundary is at exon.start (intron departs
+        # to the left in genomic coords).
         if upstream.transcripts:
             tx = upstream.transcripts[0]
             exons = tx.sorted_exons()
             if exons:
-                last_exon = exons[-1] if upstream.strand == '+' else exons[0]
+                if upstream.strand == '+':
+                    donor_boundary = exons[-1].end
+                else:
+                    donor_boundary = exons[0].start
                 donor_seq = self.genome.get_splice_donor(
-                    upstream.seqid, last_exon.end, upstream.strand)
+                    upstream.seqid, donor_boundary, upstream.strand)
                 if len(donor_seq) == 9:
                     donor_s = score_donor(donor_seq)
                     if donor_s > 2.0:  # Good splice site
