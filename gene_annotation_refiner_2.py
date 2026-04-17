@@ -5329,122 +5329,319 @@ class GeneAnnotationRefiner:
 
     def _recover_downstream_exons(self, genes: List[Gene],
                                    orf_finder: 'ORFFinder') -> None:
-        """Recover exons downstream of the current terminal exon when CDS lacks stop codon.
+        """Recover exons downstream of the current terminal exon.
 
-        Triggered when:
-          1. The gene has CDS but no stop codon.
-          2. Junction evidence lands *inside* the current terminal exon, indicating
-             a hidden intron — the exon is too long and additional sequence follows.
+        Triggered when the terminal exon has a hidden intron, detected by
+        either of two criteria (checked independently):
+          1. Junction evidence whose acceptor (j_end for − strand) lands
+             *inside* the terminal exon from *outside* — the terminal exon
+             is too long and the chain continues downstream.
+          2. The CDS has no stop codon — a catch-all for genes where the
+             above junction signal is below the read threshold.
+
+        Coverage gate — the key improvement:
+          Instead of comparing each new exon only against the terminal
+          (possibly atypical) anchor exon, the gate is computed from the
+          full set of existing internal exons.  Specifically we use the
+          10th percentile of mean coverages across all non-terminal exons
+          as a floor.  This makes the gate robust to genes with variable
+          per-exon expression and prevents false negatives when the
+          terminal exon has unusually low coverage.
 
         Algorithm:
-          a. Detect hidden intron: find junctions whose acceptor (j_end) falls
-             within the terminal exon.  The best such junction (most reads)
-             defines where to trim the exon: terminal exon start = j_end + 1.
-          b. Follow the junction chain: from the trimmed terminal exon's donor
-             position, find junctions departing there, land at the next exon's
-             acceptor, estimate exon end from the next departing junction.
-          c. Continue until a stop codon is found or no further junctions exist
-             with at least MIN_DOWNSTREAM_READS reads.
-          d. Coverage-gate: each new exon must have mean coverage ≥
-             COV_RATIO_THRESHOLD × the coverage of the last confirmed exon.
-
-        This handles cases where StringTie (or any input template) fails to
-        assemble the full 3' coding region of a gene.
+          a. Scan terminal exon for hidden introns using junction evidence.
+             For − strand: junctions with j_end inside and j_start outside
+             the terminal exon.  For + strand: junctions with j_start inside
+             and j_end outside.  Score candidates by read count × PWM quality
+             of the splice donor site; take the highest-scoring hidden intron.
+          b. Trim the terminal exon at the hidden intron boundary.
+          c. Follow the junction chain downstream: from the trimmed exon's
+             donor position find the best junction, land at the next acceptor,
+             estimate the new exon's far end from the next departing junction
+             (or coverage fall-off if no further junction found).
+          d. Coverage-gate each candidate new exon against the 10th-percentile
+             floor derived from existing exons.
+          e. Continue until a stop codon is found or no further junctions
+             exceed MIN_DOWNSTREAM_READS.
         """
         if not self.bam_evidence.available:
             return
 
         MIN_DOWNSTREAM_READS = 3   # minimum junction reads to follow
-        COV_RATIO_THRESHOLD  = 0.15  # new exon must have ≥ 15% of terminal exon coverage
         MAX_ITERATIONS       = 20  # safety: never add more than this many new exons
+
+        def _exon_coverage_floor(exons_list: list, seqid: str) -> float:
+            """10th-percentile mean coverage across the supplied exons (floor 1.0)."""
+            covs = sorted(
+                self.coverage.get_mean_coverage(seqid, e.start, e.end)
+                for e in exons_list
+            )
+            if not covs:
+                return 1.0
+            p10_idx = max(0, int(len(covs) * 0.10) - 1)
+            return max(1.0, covs[p10_idx])
+
+        def _max_search_window(exons_list: list) -> int:
+            """Compute a downstream search cap: 2× max intron length in the gene.
+
+            Prevents the exon-start lookup from jumping to a junction that
+            belongs to a completely different gene far upstream/downstream.
+            Falls back to 20 kb if the gene has no introns.
+            """
+            if len(exons_list) < 2:
+                return 20_000
+            se = sorted(exons_list, key=lambda e: e.start)
+            intron_lengths = [se[i+1].start - se[i].end - 1
+                              for i in range(len(se)-1)
+                              if se[i+1].start - se[i].end - 1 > 0]
+            if not intron_lengths:
+                return 20_000
+            intron_lengths.sort()
+            median = intron_lengths[len(intron_lengths) // 2]
+            return max(2_000, median)
 
         n_recovered = 0
         for gene in genes:
             seqid  = gene.seqid
             strand = gene.strand
             for tx in gene.transcripts:
-                if not tx.cds:
-                    continue
-                if has_stop_codon(self.genome, seqid, tx.cds, strand):
+                if not tx.exons:
                     continue
 
                 sorted_exons = sorted(tx.exons, key=lambda e: e.start)
-                if not sorted_exons:
-                    continue
+
 
                 # Identify terminal exon (3' end in transcript direction)
                 terminal_exon = sorted_exons[0] if strand == '-' else sorted_exons[-1]
-                anchor_exon   = sorted_exons[1] if (strand == '-' and
-                                                     len(sorted_exons) > 1) else (
-                                sorted_exons[-2] if len(sorted_exons) > 1 else None)
+                internal_exons = sorted_exons[1:] if strand == '-' else sorted_exons[:-1]
 
-                # --- Step (a): detect hidden intron inside terminal exon ---
-                # For + strand: junctions that START within the terminal exon
-                # indicate a hidden donor.  We want their acceptors downstream.
-                # For − strand: junctions that END within the terminal exon
-                # indicate a hidden acceptor; the "upstream" donor is to the left.
-                if strand == '+':
-                    # Search for junctions with j_end > terminal_exon.end
-                    # and j_start within terminal_exon
-                    hidden_juncs = []
-                    for j_start, j_end, j_count in self.bam_evidence.find_novel_junctions(
-                            seqid,
-                            terminal_exon.start,
-                            terminal_exon.end,
-                            min_reads=MIN_DOWNSTREAM_READS):
-                        if j_start > terminal_exon.start and j_end > terminal_exon.end:
-                            hidden_juncs.append((j_start, j_end, j_count))
-                    if not hidden_juncs:
-                        continue
-                    # Best = most reads
-                    hidden_juncs.sort(key=lambda x: -x[2])
-                    trim_start, _, _ = hidden_juncs[0]
-                    # Trim terminal exon: it now ends at trim_start - 1
-                    new_term = Feature(
-                        seqid=terminal_exon.seqid, source=terminal_exon.source,
-                        ftype=terminal_exon.ftype,
-                        start=terminal_exon.start, end=trim_start - 1,
-                        score=terminal_exon.score, strand=terminal_exon.strand,
-                        phase=terminal_exon.phase, attributes=terminal_exon.attributes)
-                    sorted_exons[-1] = new_term
-                    terminal_exon = new_term
-                    current_donor = trim_start - 1  # exon end = donor position
-
-                else:  # strand == '-'
-                    # For − strand, terminal exon = lowest genomic coords (most 3' in tx).
-                    # A hidden intron arrives from upstream (lower coords) and its
-                    # acceptor (j_end) lands partway into this exon, meaning the real
-                    # exon boundary is at j_end+1 (high-coord side should be trimmed).
-                    # j_start is OUTSIDE the exon (to the left / lower coord).
+                # ── Primary trigger: junction evidence of hidden intron ──────
+                # For − strand: find junctions whose intron END (j_end) lands
+                # inside the terminal exon and whose intron START (j_start) is
+                # outside (below) — the "extra" sequence to the left is intron.
+                # For + strand: find junctions whose intron START is inside and
+                # intron END is outside (above).
+                if strand == '-':
                     hidden_juncs = self.bam_evidence.find_junctions_ending_in(
                         seqid,
-                        terminal_exon.start + 1,  # must land strictly inside
+                        terminal_exon.start + 1,
                         terminal_exon.end - 1,
                         min_reads=MIN_DOWNSTREAM_READS)
-                    # j_start must be below (upstream of) terminal_exon
                     hidden_juncs = [(js, je, jc) for js, je, jc in hidden_juncs
                                     if js < terminal_exon.start]
-                    if not hidden_juncs:
-                        continue
-                    hidden_juncs.sort(key=lambda x: -x[2])
-                    _, trim_end, _ = hidden_juncs[0]   # j_end = last base of intron
-                    # The real terminal exon starts at trim_end + 1 (high-coord fragment)
-                    new_term = Feature(
-                        seqid=terminal_exon.seqid, source=terminal_exon.source,
-                        ftype=terminal_exon.ftype,
-                        start=trim_end + 1, end=terminal_exon.end,
-                        score=terminal_exon.score, strand=terminal_exon.strand,
-                        phase=terminal_exon.phase, attributes=terminal_exon.attributes)
-                    sorted_exons[0] = new_term
-                    terminal_exon = new_term
-                    # The donor for the chain step is the low-coord end of new terminal exon
-                    current_donor = trim_end + 1
+                else:
+                    hidden_juncs_raw = self.bam_evidence.find_junctions_starting_in(
+                        seqid,
+                        terminal_exon.start + 1,
+                        terminal_exon.end - 1,
+                        min_reads=MIN_DOWNSTREAM_READS)
+                    hidden_juncs = [(js, je, jc) for js, je, jc in hidden_juncs_raw
+                                    if je > terminal_exon.end]
 
-                # Estimate anchor coverage for gating new exons
-                anchor_cov = (self.coverage.get_mean_coverage(
-                    seqid, anchor_exon.start, anchor_exon.end)
-                    if anchor_exon else 1.0)
-                anchor_cov = max(anchor_cov, 1.0)
+                # ── Secondary trigger: CDS lacks stop codon ─────────────────
+                no_stop = tx.cds and not has_stop_codon(
+                    self.genome, seqid, tx.cds, strand)
+
+                if not hidden_juncs and not no_stop:
+                    continue
+
+                # Score hidden junction candidates by reads × donor PWM.
+                # For − strand the donor site (5' end of intron in transcript
+                # direction) is at genomic position j_start (low end of intron),
+                # and we score the sequence just upstream of j_start on the
+                # minus strand.  For + strand the donor is at j_start (high end
+                # of exon) on the plus strand.
+                best_hidden = None
+                if hidden_juncs:
+                    # Junction read count is the primary evidence — portcullis
+                    # pre-filters to reliable junctions, so MIN_DOWNSTREAM_READS
+                    # is sufficient.  PWM is computed as a secondary ranking key
+                    # only, NOT as a hard filter: non-canonical exon/intron context
+                    # can score very negatively in the PWM even when the junction
+                    # is real (confirmed by read depth).
+                    scored = []
+                    for js, je, jc in hidden_juncs:
+                        if strand == '-':
+                            # Donor on minus strand: intron is to the LEFT of
+                            # the terminal exon.  Donor dinucleotide is at the
+                            # RIGHT side of the intron (je = last intron base,
+                            # je+1 = first exon base = exon.start).
+                            donor_exon_end = je + 1
+                            ss_seq = self.genome.get_sequence(
+                                seqid,
+                                donor_exon_end - DONOR_INTRON_BP,
+                                donor_exon_end + DONOR_EXON_BP - 1)
+                            pwm = score_donor(reverse_complement(ss_seq))
+                        else:
+                            # Donor on plus strand: exon ends at js-1.
+                            ss_seq = self.genome.get_sequence(
+                                seqid,
+                                js - DONOR_EXON_BP,
+                                js + DONOR_INTRON_BP - 1)
+                            pwm = score_donor(ss_seq)
+                        scored.append((js, je, jc, pwm))
+                    # Primary sort by reads, secondary by PWM
+                    scored.sort(key=lambda x: (-x[2], -x[3]))
+                    best_hidden = scored[0]
+
+                # If no junction-based hidden intron but secondary trigger
+                # (no stop codon), proceed without trimming.
+                do_trim = best_hidden is not None
+
+                if strand == '-':
+                    if do_trim:
+                        _, trim_end, _, _ = best_hidden  # j_end = last base of intron
+                        # Real terminal exon: the high-coord fragment after the intron
+                        new_term = Feature(
+                            seqid=terminal_exon.seqid,
+                            source=terminal_exon.source,
+                            ftype=terminal_exon.ftype,
+                            start=trim_end + 1, end=terminal_exon.end,
+                            score=terminal_exon.score,
+                            strand=terminal_exon.strand,
+                            phase=terminal_exon.phase,
+                            attributes=terminal_exon.attributes)
+                        sorted_exons[0] = new_term
+                        terminal_exon = new_term
+                    # current_donor: the low-coord end of the trimmed terminal exon.
+                    # For − strand the intron departs from terminal_exon.start toward
+                    # lower genomic coords; reads_at_donor queries intron_start = pos
+                    # i.e. pos = terminal_exon.start (intron starts here going left).
+                    current_donor = terminal_exon.start
+                else:
+                    if do_trim:
+                        trim_start, _, _, _ = best_hidden
+                        new_term = Feature(
+                            seqid=terminal_exon.seqid,
+                            source=terminal_exon.source,
+                            ftype=terminal_exon.ftype,
+                            start=terminal_exon.start, end=trim_start - 1,
+                            score=terminal_exon.score,
+                            strand=terminal_exon.strand,
+                            phase=terminal_exon.phase,
+                            attributes=terminal_exon.attributes)
+                        sorted_exons[-1] = new_term
+                        terminal_exon = new_term
+                    current_donor = terminal_exon.end
+
+                # Coverage floor: 10th percentile of all internal exon coverages.
+                # Fall back to terminal exon coverage if no internal exons.
+                ref_exons = internal_exons if internal_exons else [terminal_exon]
+                cov_floor = _exon_coverage_floor(ref_exons, seqid)
+                # Max search window for exon-boundary lookup: 2× max intron length.
+                max_window = _max_search_window(sorted_exons)
+
+                # ── Steps (b–e): follow junction chain downstream ───────────
+                new_exons = []
+                for _ in range(MAX_ITERATIONS):
+                    if strand == '-':
+                        # On − strand "downstream" = lower genomic coords.
+                        # current_donor = terminal/last exon's start position.
+                        # The intron starts at current_donor (going leftward);
+                        # reads_at_donor(seqid, exon.end, ...) expects exon.end,
+                        # but here we need reads where intron_start = current_donor.
+                        # reads_at_donor queries intron_start = donor_pos + 1, so
+                        # donor_pos = current_donor - 1.
+                        next_reads = self.bam_evidence.reads_at_donor(
+                            seqid, current_donor - 1, tolerance=2)
+                        if next_reads < MIN_DOWNSTREAM_READS:
+                            break
+                        # Find the specific best junction departing from here
+                        best_junc = None
+                        for j_start, j_end, j_count in \
+                                self.bam_evidence.find_novel_junctions(
+                                    seqid,
+                                    max(1, current_donor - 500_000),
+                                    current_donor,
+                                    min_reads=MIN_DOWNSTREAM_READS):
+                            if abs(j_end - (current_donor - 1)) <= 3:
+                                if best_junc is None or j_count > best_junc[2]:
+                                    best_junc = (j_start, j_end, j_count)
+                        if best_junc is None:
+                            break
+                        j_start, _, j_count = best_junc
+                        exon_end = j_start - 1   # exon ends just before intron start
+                        # Find the start of this new exon: next departing junction
+                        next_junc = None
+                        for j2_start, j2_end, j2_count in \
+                                self.bam_evidence.find_novel_junctions(
+                                    seqid,
+                                    max(1, exon_end - 50_000),
+                                    exon_end,
+                                    min_reads=MIN_DOWNSTREAM_READS):
+                            if j2_end < exon_end:
+                                if next_junc is None or j2_count > next_junc[2]:
+                                    next_junc = (j2_start, j2_end, j2_count)
+                        exon_start = (next_junc[1] + 1
+                                      if next_junc else max(1, exon_end - 200))
+                        current_donor = exon_start
+
+                    else:  # strand == '+'
+                        next_reads = self.bam_evidence.reads_at_donor(
+                            seqid, current_donor, tolerance=2)
+                        if next_reads < MIN_DOWNSTREAM_READS:
+                            break
+                        best_junc = None
+                        for j_start, j_end, j_count in \
+                                self.bam_evidence.find_novel_junctions(
+                                    seqid,
+                                    current_donor,
+                                    current_donor + 500_000,
+                                    min_reads=MIN_DOWNSTREAM_READS):
+                            if abs(j_start - (current_donor + 1)) <= 3:
+                                if best_junc is None or j_count > best_junc[2]:
+                                    best_junc = (j_start, j_end, j_count)
+                        if best_junc is None:
+                            break
+                        _, j_end, j_count = best_junc
+                        exon_start = j_end + 1
+                        next_junc = None
+                        for j2_start, j2_end, j2_count in \
+                                self.bam_evidence.find_novel_junctions(
+                                    seqid,
+                                    exon_start,
+                                    exon_start + 50_000,
+                                    min_reads=MIN_DOWNSTREAM_READS):
+                            if j2_start > exon_start:
+                                if next_junc is None or j2_count > next_junc[2]:
+                                    next_junc = (j2_start, j2_end, j2_count)
+                        exon_end = (next_junc[0] - 1
+                                    if next_junc else exon_start + 200)
+                        current_donor = exon_end
+
+                    # Coverage gate against the reference exon floor
+                    exon_cov = self.coverage.get_mean_coverage(
+                        seqid, exon_start, exon_end)
+                    if exon_cov < cov_floor * 0.15:
+                        logger.debug(
+                            f"  Downstream exon {exon_start}-{exon_end} failed "
+                            f"coverage gate ({exon_cov:.1f} < "
+                            f"{cov_floor * 0.15:.1f}, floor={cov_floor:.1f})")
+                        break
+
+                    new_exon = Feature(
+                        seqid=seqid, source='Refined', ftype='exon',
+                        start=exon_start, end=exon_end,
+                        score=0.5, strand=strand,
+                        phase='.', attributes={'sources': 'junction_recovery'})
+                    new_exons.append(new_exon)
+                    logger.info(
+                        f"  Recovered downstream exon {exon_start}-{exon_end} "
+                        f"for {gene.gene_id} ({j_count} reads, cov={exon_cov:.1f})")
+
+                    # Stop when a valid ORF with stop codon is found
+                    test_exons = sorted_exons + new_exons
+                    test_orf = orf_finder.find_best_orf(
+                        seqid, test_exons, strand, coverage=self.coverage)
+                    if test_orf is not None:
+                        new_cds_list = orf_finder.orf_to_genomic_cds(
+                            seqid, test_exons, strand, test_orf[0], test_orf[1])
+                        if new_cds_list and has_stop_codon(
+                                self.genome, seqid, new_cds_list, strand):
+                            logger.info(
+                                f"  Stop codon found after {len(new_exons)} "
+                                f"recovered exon(s) for {gene.gene_id}")
+                            break
 
                 # --- Step (b–c): follow junction chain downstream ---
                 new_exons = []
@@ -5468,66 +5665,100 @@ class GeneAnnotationRefiner:
                             break
                         _, j_end, j_count = best_junc
                         exon_start = j_end + 1
-                        # Find the end of this new exon: look for next departing junc
-                        next_junc = None
-                        for j2_start, j2_end, j2_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid, exon_start,
-                                    exon_start + 50_000,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if j2_start > exon_start:
-                                if next_junc is None or j2_count > next_junc[2]:
-                                    next_junc = (j2_start, j2_end, j2_count)
-                        exon_end = (next_junc[0] - 1
-                                    if next_junc else exon_start + 200)
+                        # Find the end of this new exon: the most adjacent departing
+                        # junction (lowest j_start > exon_start) defines the boundary.
+                        right_juncs = self.bam_evidence.find_junctions_starting_in(
+                            seqid,
+                            exon_start + 1,
+                            exon_start + max_window,
+                            min_reads=MIN_DOWNSTREAM_READS)
+                        right_juncs = [(js, je, jc) for js, je, jc in right_juncs
+                                       if js > exon_start]
+                        if right_juncs:
+                            next_junc = min(right_juncs, key=lambda x: x[0])
+                            exon_end = next_junc[0] - 1
+                        else:
+                            exon_end = exon_start + 200
                         current_donor = exon_end
 
                     else:  # strand == '-'
-                        # For − strand, "downstream in transcript" = lower genomic coord
-                        # current_donor is the exon.start of terminal exon (low-coord end)
-                        # Find junctions departing from here (reads_at_donor uses exon.start-1)
-                        next_reads = self.bam_evidence.reads_at_donor(
-                            seqid, current_donor - 1, tolerance=2)
+                        # For − strand, "downstream in transcript" = lower genomic coord.
+                        # current_donor = exon.start of the current exon (low-coord end).
+                        # The intron to its LEFT has j_end = current_donor - 1.
+                        # Use reads_at_acceptor(current_donor) rather than
+                        # reads_at_donor(current_donor - 1): on minus strand the
+                        # donor dinucleotide of this intron is at the exon's
+                        # LEFT boundary (current_donor-1 = j_end = last intron base).
+                        next_reads = self.bam_evidence.reads_at_acceptor(
+                            seqid, current_donor, tolerance=2)
                         if next_reads < MIN_DOWNSTREAM_READS:
                             break
-                        # Find the specific junction: j_start should be ~ current_donor-1
-                        best_junc = None
-                        for j_start, j_end, j_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid,
-                                    max(0, current_donor - 500_000),
-                                    current_donor,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if abs(j_end - (current_donor - 1)) <= 3:
-                                if best_junc is None or j_count > best_junc[2]:
-                                    best_junc = (j_start, j_end, j_count)
-                        if best_junc is None:
+                        # Find the specific junction: j_end ≈ current_donor - 1
+                        candidates = self.bam_evidence.find_junctions_ending_in(
+                            seqid,
+                            current_donor - 1 - 3,
+                            current_donor - 1 + 3,
+                            min_reads=MIN_DOWNSTREAM_READS)
+                        if not candidates:
                             break
+                        # Among candidates take the one with most reads
+                        best_junc = max(candidates, key=lambda x: x[2])
                         j_start, _, j_count = best_junc
                         exon_end = j_start - 1   # exon ends just before intron start
-                        # Find the start of this new exon: next departing junction
-                        next_junc = None
-                        for j2_start, j2_end, j2_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid,
-                                    max(0, exon_end - 50_000),
-                                    exon_end,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if j2_end < exon_end:
-                                if next_junc is None or j2_count > next_junc[2]:
-                                    next_junc = (j2_start, j2_end, j2_count)
-                        exon_start = (next_junc[1] + 1
-                                      if next_junc else exon_end - 200)
+                        # Find the start of this new exon: the intron further left
+                        # that defines the exon's left boundary.
+                        # Use the junction with the HIGHEST j_end (most adjacent to
+                        # exon_end) rather than highest read count — this prevents a
+                        # more distal high-coverage junction from mis-specifying the
+                        # exon start.
+                        left_juncs = self.bam_evidence.find_junctions_ending_in(
+                            seqid,
+                            max(1, exon_end - max_window),
+                            exon_end - 1,
+                            min_reads=MIN_DOWNSTREAM_READS)
+                        # Filter to plausible exon sizes and pick the most
+                        # proximal (highest j_end) whose proposed exon start
+                        # position has coverage consistent with the gene.
+                        # A junction from a different gene can land in the
+                        # window but its exon start will have lower coverage
+                        # (or the region between the exon start and exon_end
+                        # will span two coverage plateaus separated by a gap).
+                        plausible_left = []
+                        for js, je, jc in left_juncs:
+                            cand_start = je + 1
+                            exon_len = exon_end - cand_start + 1
+                            if exon_len > 5_000:
+                                continue
+                            # Require consistent coverage across the whole
+                            # proposed exon body (mean > floor × 0.15).
+                            body_cov = self.coverage.get_mean_coverage(
+                                seqid, cand_start, exon_end)
+                            if body_cov >= cov_floor * 0.15:
+                                plausible_left.append((js, je, jc))
+                        if plausible_left:
+                            next_junc = max(plausible_left, key=lambda x: x[1])
+                            exon_start = next_junc[1] + 1
+                        else:
+                            # No junction evidence: estimate start from coverage.
+                            # Walk left from exon_end until coverage drops below
+                            # the gene floor; cap at 500 bp to avoid runaway.
+                            exon_start = exon_end
+                            for pos in range(exon_end, max(1, exon_end - 500), -1):
+                                pos_cov = self.coverage.get_mean_coverage(
+                                    seqid, pos, pos)
+                                if pos_cov < cov_floor * 0.15:
+                                    break
+                                exon_start = pos
                         current_donor = exon_start
 
-                    # Coverage gate
+                    # Coverage gate against the reference exon floor
                     exon_cov = self.coverage.get_mean_coverage(
                         seqid, exon_start, exon_end)
-                    if exon_cov < anchor_cov * COV_RATIO_THRESHOLD:
+                    if exon_cov < cov_floor * 0.15:
                         logger.debug(
                             f"  Downstream exon {exon_start}-{exon_end} failed "
                             f"coverage gate ({exon_cov:.1f} < "
-                            f"{anchor_cov * COV_RATIO_THRESHOLD:.1f})")
+                            f"{cov_floor * 0.15:.1f}, floor={cov_floor:.1f})")
                         break
 
                     new_exon = Feature(
@@ -5536,9 +5767,9 @@ class GeneAnnotationRefiner:
                         score=0.5, strand=strand,
                         phase='.', attributes={'sources': 'junction_recovery'})
                     new_exons.append(new_exon)
-                    logger.debug(
+                    logger.info(
                         f"  Recovered downstream exon {exon_start}-{exon_end} "
-                        f"({j_count} reads, cov={exon_cov:.1f})")
+                        f"for {gene.gene_id} ({j_count} reads, cov={exon_cov:.1f})")
 
                     # Check if we now have a stop codon
                     test_exons = sorted_exons + new_exons
