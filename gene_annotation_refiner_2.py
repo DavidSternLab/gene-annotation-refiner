@@ -3046,7 +3046,13 @@ class GeneMerger:
                     logger.debug(f"Merge evidence: Frame compatible between "
                                f"{upstream.gene_id} and {downstream.gene_id}")
 
-        # Check 4: Coverage bridge between genes
+        # Check 4: Coverage bridge between genes.
+        # Valid coverage bridges have gap coverage roughly consistent with
+        # the flanking genes (30% - 300% of gene coverage).  If gap coverage
+        # is dramatically higher than gene coverage, the gap contains a
+        # separate, more highly-expressed gene (not a bridge) and this should
+        # VETO the merge rather than support it.
+        gap_has_other_gene = False
         if gap_size > 0 and gap_size < 50000:
             gap_cov = self.coverage.get_mean_coverage(
                 upstream.seqid, gap_start, gap_end)
@@ -3056,10 +3062,23 @@ class GeneMerger:
                 upstream.seqid, downstream.start, min(downstream.start + 100, downstream.end))
             avg_gene_cov = (upstream_cov + downstream_cov) / 2.0
 
-            if avg_gene_cov > 1.0 and gap_cov / avg_gene_cov > 0.3:
-                evidence_count += 1
-                logger.debug(f"Merge evidence: Coverage bridge "
-                           f"(gap_cov={gap_cov:.1f}, gene_cov={avg_gene_cov:.1f})")
+            if avg_gene_cov > 1.0:
+                ratio = gap_cov / avg_gene_cov
+                if ratio > 3.0:
+                    gap_has_other_gene = True
+                    logger.debug(
+                        f"Merge vetoed: gap coverage ({gap_cov:.1f}) is "
+                        f"{ratio:.1f}x higher than gene coverage "
+                        f"({avg_gene_cov:.1f}) — likely separate gene in gap "
+                        f"({upstream.gene_id} <-> {downstream.gene_id})")
+                elif ratio > 0.3:
+                    evidence_count += 1
+                    logger.debug(
+                        f"Merge evidence: Coverage bridge "
+                        f"(gap_cov={gap_cov:.1f}, gene_cov={avg_gene_cov:.1f})")
+
+        if gap_has_other_gene:
+            return False
 
         # Check 5: BAM spliced reads connecting the two genes
         if self.bam.available:
