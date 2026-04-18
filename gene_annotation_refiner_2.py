@@ -1192,6 +1192,133 @@ class Gene:
 
 
 # ============================================================================
+# Gene tracer — follow target genes through every pipeline stage
+# ============================================================================
+class GeneTracer:
+    """Follow selected genes through every pipeline stage.
+
+    Enabled with --trace_gene <id> (repeatable) and/or
+    --trace_region <seqid>:<start>-<end> (repeatable).  When enabled,
+    snapshots matching genes at every pipeline step and logs the
+    merge-evidence breakdown for any gene pair involving a target.
+
+    A gene matches when any of the following is true:
+      - gene.gene_id contains a target ID as a substring (exact or partial)
+      - any transcript_id contains a target ID
+      - gene.attributes['merged_from'] / ['evidence_sources'] contain a
+        target ID — catches contributing source-gene IDs after Step 5
+        merges and after Step 9 renumbering
+      - gene.seqid == target seqid AND gene footprint overlaps target region
+
+    Substring matching lets a single Helixer ID (e.g. "005173") match
+    "Apis_helixer_scaffold_2_005173.1" and any refined gene that
+    inherited it via the merge trail.  When the refined/renumbered ID
+    is all that's known, use --trace_region to follow the locus.
+
+    All output is prefixed with '[TRACE]' for easy grepping.  The tracer
+    is a no-op when disabled (the common case): snapshot() returns
+    immediately if no targets were registered.
+    """
+
+    def __init__(self, gene_ids=None, regions=None):
+        self.gene_ids = [g for g in (gene_ids or []) if g]
+        self.regions = list(regions or [])  # List[(seqid, start, end)]
+        self.enabled = bool(self.gene_ids or self.regions)
+
+    @staticmethod
+    def parse_region(s: str):
+        """Parse 'seqid:start-end' into (seqid, int start, int end)."""
+        if ':' not in s:
+            raise ValueError(
+                f"--trace_region must be 'seqid:start-end' (got {s!r})")
+        seqid, coords = s.split(':', 1)
+        if '-' not in coords:
+            raise ValueError(
+                f"--trace_region must be 'seqid:start-end' (got {s!r})")
+        start_s, end_s = coords.split('-', 1)
+        return (seqid, int(start_s.replace(',', '')),
+                int(end_s.replace(',', '')))
+
+    def matches(self, gene: 'Gene') -> bool:
+        if not self.enabled or gene is None:
+            return False
+        attrs = gene.attributes or {}
+        for gid in self.gene_ids:
+            if gid in gene.gene_id:
+                return True
+            if gid in attrs.get('merged_from', ''):
+                return True
+            if gid in attrs.get('evidence_sources', ''):
+                return True
+            for tx in getattr(gene, 'transcripts', []) or []:
+                if gid in tx.transcript_id:
+                    return True
+        for rseqid, rstart, rend in self.regions:
+            if (gene.seqid == rseqid
+                    and gene.end >= rstart and gene.start <= rend):
+                return True
+        return False
+
+    def region_overlaps(self, seqid: str, start: int, end: int) -> bool:
+        """Does a coordinate range overlap any --trace_region?"""
+        if not self.enabled:
+            return False
+        for rseqid, rstart, rend in self.regions:
+            if seqid == rseqid and end >= rstart and start <= rend:
+                return True
+        return False
+
+    def pair_matches(self, gene_a: 'Gene', gene_b: 'Gene') -> bool:
+        """True if either gene matches — used to filter merge-evidence logs."""
+        return self.matches(gene_a) or self.matches(gene_b)
+
+    def snapshot(self, stage: str, genes, detailed: bool = True) -> None:
+        """Log every gene matching any target at this stage.
+
+        When `detailed` is True (default), also dump per-transcript
+        exon and CDS coordinate lists.  Set detailed=False for a
+        compact one-line-per-gene summary in steps where you only
+        care about gene-level boundaries.
+        """
+        if not self.enabled:
+            return
+        hits = [g for g in genes if self.matches(g)]
+        if not hits:
+            logger.info(f"[TRACE] {stage}: no matching genes "
+                        f"(of {len(genes)} total)")
+            return
+        for g in hits:
+            self._dump_gene(stage, g, detailed)
+
+    def _dump_gene(self, stage: str, g: 'Gene', detailed: bool) -> None:
+        attrs = g.attributes or {}
+        n_tx = len(getattr(g, 'transcripts', []) or [])
+        ev = attrs.get('evidence_sources', '?')
+        mf = attrs.get('merged_from', '')
+        head = (f"[TRACE] {stage} | {g.gene_id} | "
+                f"{g.seqid}:{g.start}-{g.end}({g.strand}) | "
+                f"tx={n_tx} src={ev}")
+        if mf:
+            head += f" merged_from={mf}"
+        logger.info(head)
+        if not detailed:
+            return
+        for tx in getattr(g, 'transcripts', []) or []:
+            exons = sorted((e.start, e.end) for e in tx.exons)
+            cds = sorted((c.start, c.end) for c in tx.cds)
+            logger.info(
+                f"[TRACE]   tx={tx.transcript_id} "
+                f"exons({len(exons)})={exons} "
+                f"cds({len(cds)})={cds}")
+
+    def event(self, stage: str, message: str) -> None:
+        """Log a freeform event (no snapshot).  Used by should_merge etc."""
+        if not self.enabled:
+            return
+        logger.info(f"[TRACE] {stage}: {message}")
+
+
+# ============================================================================
 # GFF/GTF Parsers
 # ============================================================================
 def parse_gff_attributes(attr_string: str, fmt="gff3") -> dict:
@@ -2960,11 +3087,18 @@ class GeneMerger:
     """Handle merging of gene models that should be combined."""
 
     def __init__(self, genome: GenomeAccess, coverage: CoverageAccess,
-                 bam_evidence=None, st_genes=None):
+                 bam_evidence=None, st_genes=None, tracer: 'GeneTracer' = None):
         self.genome = genome
         self.coverage = coverage
         self.bam = bam_evidence or NoBAMEvidence()
         self.st_genes = st_genes or []
+        self.tracer = tracer or GeneTracer()
+
+    def _trace_ev(self, msg: str, upstream: Gene, downstream: Gene) -> None:
+        """Emit merge-evidence line as debug; also to trace log if pair matches."""
+        logger.debug(msg)
+        if self.tracer.enabled and self.tracer.pair_matches(upstream, downstream):
+            logger.info(f"[TRACE] should_merge: {msg}")
 
     def should_merge(self, gene_a: Gene, gene_b: Gene) -> bool:
         """Determine if two adjacent genes should be merged.
@@ -2983,6 +3117,11 @@ class GeneMerger:
         # gene_a is always left of gene_b in genomic coordinates (caller
         # iterates sorted genes).  Check non-overlap in genomic order.
         if gene_a.end >= gene_b.start:
+            if self.tracer.enabled and self.tracer.pair_matches(gene_a, gene_b):
+                self.tracer.event(
+                    "should_merge",
+                    f"{gene_a.gene_id} x {gene_b.gene_id}: REJECT "
+                    f"(overlapping, not adjacent)")
             return False  # Overlapping, not adjacent
 
         # Upstream/downstream in transcript direction
@@ -2998,6 +3137,11 @@ class GeneMerger:
         gap_size = gap_end - gap_start + 1
 
         if gap_size <= 0 or gap_size > 50000:
+            if self.tracer.enabled and self.tracer.pair_matches(gene_a, gene_b):
+                self.tracer.event(
+                    "should_merge",
+                    f"{gene_a.gene_id} x {gene_b.gene_id}: REJECT "
+                    f"(gap_size={gap_size} outside [1, 50000])")
             return False
 
         evidence_count = 0
@@ -3006,12 +3150,20 @@ class GeneMerger:
         if gap_size > 20000:
             evidence_required = 3
 
+        if self.tracer.enabled and self.tracer.pair_matches(upstream, downstream):
+            self.tracer.event(
+                "should_merge",
+                f"evaluating {upstream.gene_id} -> {downstream.gene_id} "
+                f"gap={gap_size} required={evidence_required}")
+
         # Check 1: Does the upstream gene lack a stop codon?
         if upstream.transcripts:
             tx = upstream.transcripts[0]
             if tx.cds and not has_stop_codon(self.genome, upstream.seqid, tx.cds, upstream.strand):
                 evidence_count += 1
-                logger.debug(f"Merge evidence: {upstream.gene_id} lacks stop codon")
+                self._trace_ev(
+                    f"Merge evidence: {upstream.gene_id} lacks stop codon",
+                    upstream, downstream)
 
         # Check 2: Does the upstream gene end with a splice donor site?
         # For + strand the 3' terminal exon is exons[-1] and the donor
@@ -3032,7 +3184,10 @@ class GeneMerger:
                     donor_s = score_donor(donor_seq)
                     if donor_s > 2.0:  # Good splice site
                         evidence_count += 1
-                        logger.debug(f"Merge evidence: {upstream.gene_id} ends with splice donor")
+                        self._trace_ev(
+                            f"Merge evidence: {upstream.gene_id} ends with "
+                            f"splice donor (score={donor_s:.2f})",
+                            upstream, downstream)
 
         # Check 3: Reading frame compatibility
         if upstream.transcripts and downstream.transcripts:
@@ -3043,8 +3198,10 @@ class GeneMerger:
                     up_tx, down_tx, upstream.strand)
                 if frame_compatible:
                     evidence_count += 1
-                    logger.debug(f"Merge evidence: Frame compatible between "
-                               f"{upstream.gene_id} and {downstream.gene_id}")
+                    self._trace_ev(
+                        f"Merge evidence: Frame compatible between "
+                        f"{upstream.gene_id} and {downstream.gene_id}",
+                        upstream, downstream)
 
         # Check 4: Coverage bridge between genes.
         # Valid coverage bridges have gap coverage roughly consistent with
@@ -3066,16 +3223,18 @@ class GeneMerger:
                 ratio = gap_cov / avg_gene_cov
                 if ratio > 3.0:
                     gap_has_other_gene = True
-                    logger.debug(
+                    self._trace_ev(
                         f"Merge vetoed: gap coverage ({gap_cov:.1f}) is "
                         f"{ratio:.1f}x higher than gene coverage "
                         f"({avg_gene_cov:.1f}) — likely separate gene in gap "
-                        f"({upstream.gene_id} <-> {downstream.gene_id})")
+                        f"({upstream.gene_id} <-> {downstream.gene_id})",
+                        upstream, downstream)
                 elif ratio > 0.3:
                     evidence_count += 1
-                    logger.debug(
+                    self._trace_ev(
                         f"Merge evidence: Coverage bridge "
-                        f"(gap_cov={gap_cov:.1f}, gene_cov={avg_gene_cov:.1f})")
+                        f"(gap_cov={gap_cov:.1f}, gene_cov={avg_gene_cov:.1f})",
+                        upstream, downstream)
 
         if gap_has_other_gene:
             return False
@@ -3091,12 +3250,19 @@ class GeneMerger:
                 if (upstream.start <= j_start <= upstream.end and
                         downstream.start <= j_end <= downstream.end):
                     evidence_count += 1
-                    logger.debug(f"Merge evidence: BAM spliced reads connect genes "
-                               f"({j_count} reads, junction {j_start}-{j_end})")
+                    self._trace_ev(
+                        f"Merge evidence: BAM spliced reads connect genes "
+                        f"({j_count} reads, junction {j_start}-{j_end})",
+                        upstream, downstream)
                     break
 
         # Need sufficient evidence to merge
         if evidence_count < evidence_required:
+            if self.tracer.enabled and self.tracer.pair_matches(upstream, downstream):
+                self.tracer.event(
+                    "should_merge",
+                    f"{upstream.gene_id} x {downstream.gene_id}: REJECT "
+                    f"(evidence {evidence_count} < required {evidence_required})")
             return False
 
         # Veto merge if StringTie models the two regions as separate genes
@@ -3119,8 +3285,10 @@ class GeneMerger:
                 a_ids = set(g.gene_id for g in st_genes_in_a)
                 b_ids = set(g.gene_id for g in st_genes_in_b)
                 if not a_ids & b_ids:  # different ST gene IDs
-                    logger.debug(f"Merge vetoed: StringTie models {upstream.gene_id} "
-                               f"and {downstream.gene_id} as separate genes")
+                    self._trace_ev(
+                        f"Merge vetoed: StringTie models {upstream.gene_id} "
+                        f"and {downstream.gene_id} as separate genes",
+                        upstream, downstream)
                     return False
 
         # Check coverage continuity in the gap — require >50% of flanking coverage
@@ -3132,10 +3300,17 @@ class GeneMerger:
                 downstream.seqid, downstream.start, min(downstream.end, downstream.start + 500))
             flank_cov = (up_cov + down_cov) / 2 if (up_cov + down_cov) > 0 else 1
             if gap_cov < flank_cov * 0.1:
-                logger.debug(f"Merge vetoed: coverage gap ({gap_cov:.1f} vs "
-                           f"flanking {flank_cov:.1f})")
+                self._trace_ev(
+                    f"Merge vetoed: coverage gap ({gap_cov:.1f} vs "
+                    f"flanking {flank_cov:.1f})",
+                    upstream, downstream)
                 return False
 
+        if self.tracer.enabled and self.tracer.pair_matches(upstream, downstream):
+            self.tracer.event(
+                "should_merge",
+                f"{upstream.gene_id} x {downstream.gene_id}: ACCEPT "
+                f"(evidence {evidence_count}/{evidence_required}, gap={gap_size})")
         return True
 
     def _check_frame_compatibility(self, tx_a: Transcript, tx_b: Transcript,
@@ -4233,11 +4408,18 @@ class GeneAnnotationRefiner:
                  manual_annotation_path: str = None,
                  refine_existing_path: str = None,
                  scoring_config: 'ScoringConfig' = None,
-                 pwm_organism: str = 'drosophila'):
+                 pwm_organism: str = 'drosophila',
+                 tracer: 'GeneTracer' = None):
         self.genome = GenomeAccess(genome_path)
         self.coverage = CoverageAccess(bigwig_path) if bigwig_path else NoCoverageAccess()
         self.cfg = scoring_config or ScoringConfig()
         self.pwm_organism = pwm_organism
+        self.tracer = tracer or GeneTracer()
+        if self.tracer.enabled:
+            tgt = (f"genes={self.tracer.gene_ids}" if self.tracer.gene_ids else "")
+            rgs = (f"regions={self.tracer.regions}" if self.tracer.regions else "")
+            logger.info(f"[TRACE] Gene tracer ENABLED — "
+                        f"{' '.join(x for x in (tgt, rgs) if x)}")
 
         self.ncrna_threshold = self.cfg.ncrna_threshold
         self.coding_threshold = self.cfg.coding_threshold
@@ -4334,7 +4516,7 @@ class GeneAnnotationRefiner:
                                                   config=self.cfg,
                                                   evidence_index=self.evidence_index)
         self.merger = GeneMerger(self.genome, self.coverage, self.bam_evidence,
-                                 st_genes=self.st_genes)
+                                 st_genes=self.st_genes, tracer=self.tracer)
         self.utr_recovery = UTRRecovery(self.genome, self.coverage,
                                          self.bam_evidence)
         self.splice_eval = SpliceSiteEvaluator(self.genome, self.coverage,
@@ -4464,6 +4646,15 @@ class GeneAnnotationRefiner:
             logger.info(f"  Manual annotations: {len(self.manual_genes)} genes")
         logger.info("=" * 60)
 
+        if self.tracer.enabled:
+            self.tracer.snapshot("Input: Helixer", self.helixer_genes)
+            self.tracer.snapshot("Input: TransDecoder", self.td_genes)
+            self.tracer.snapshot("Input: StringTie", self.st_genes)
+            if self.existing_genes:
+                self.tracer.snapshot("Input: Existing", self.existing_genes)
+            if self.manual_genes:
+                self.tracer.snapshot("Input: Manual", self.manual_genes)
+
         if self.refine_existing_mode:
             # --- Refine-existing mode ---
             # Start from the existing annotation; skip consensus building
@@ -4497,9 +4688,12 @@ class GeneAnnotationRefiner:
                 consensus_genes.append(cgene)
             logger.info(f"  Loaded {len(consensus_genes)} existing gene models")
 
+            self.tracer.snapshot("After Step 1 (refine-existing load)", consensus_genes)
+
             # Incorporate manual annotations: add/replace overlapping genes
             if self.manual_genes:
                 consensus_genes = self._incorporate_manual_genes(consensus_genes)
+                self.tracer.snapshot("After manual incorporation", consensus_genes)
 
         else:
             # --- Full consensus mode ---
@@ -4507,10 +4701,12 @@ class GeneAnnotationRefiner:
             logger.info("\nStep 1: Building consensus gene models...")
             consensus_genes = self._build_consensus()
             logger.info(f"  Built {len(consensus_genes)} initial consensus models")
+            self.tracer.snapshot("After Step 1 (consensus)", consensus_genes)
 
             # Incorporate manual annotations into consensus
             if self.manual_genes:
                 consensus_genes = self._incorporate_manual_genes(consensus_genes)
+                self.tracer.snapshot("After manual incorporation", consensus_genes)
 
             # Step 1b: Split genes where StringTie/TD model separate genes
             if self.st_genes:
@@ -4526,6 +4722,7 @@ class GeneAnnotationRefiner:
                 if len(split_genes) > len(consensus_genes):
                     logger.info(f"  Split {len(consensus_genes)} genes into {len(split_genes)}")
                 consensus_genes = split_genes
+                self.tracer.snapshot("After Step 1b (StringTie split)", consensus_genes)
 
         # Validate coordinates before processing
         logger.info("\nValidating gene coordinates...")
@@ -4569,6 +4766,7 @@ class GeneAnnotationRefiner:
                 tx for tx in gene.transcripts
                 if self._all_splices_canonical(gene.seqid, tx.exons, gene.strand)
             ]
+        self.tracer.snapshot("After Step 2 (canonical splice enforce)", consensus_genes)
 
         # Step 3: Evaluate splice sites and UTR boundaries
         logger.info("\nStep 3: Evaluating splice sites and UTR boundaries...")
@@ -4588,6 +4786,7 @@ class GeneAnnotationRefiner:
 
         # Re-validate after splice site modifications
         consensus_genes = self._validate_gene_coordinates(consensus_genes)
+        self.tracer.snapshot("After Step 3 (splice/UTR eval)", consensus_genes)
 
         # Step 4: Recovering UTRs from StringTie
         logger.info("\nStep 4: Recovering UTRs from StringTie...")
@@ -4599,13 +4798,17 @@ class GeneAnnotationRefiner:
 
         # Re-validate after UTR recovery
         consensus_genes = self._validate_gene_coordinates(consensus_genes)
+        self.tracer.snapshot("After Step 4 (UTR recovery)", consensus_genes)
 
         # Step 5: Evaluate gene merging
         logger.info("\nStep 5: Evaluating gene merges...")
         consensus_genes = self._evaluate_merges(consensus_genes)
         logger.info(f"  After merging: {len(consensus_genes)} genes")
+        self.tracer.snapshot("After Step 5 (merges)", consensus_genes)
 
-        # Step 5b: Post-merge splice validation and cleanup
+        # Step 5b: Post-merge splice validation and cleanup.
+        # Each substep is instrumented for traced genes so you can see
+        # which specific cleanup dropped an exon.
         logger.info("\nStep 5b: Post-merge splice validation...")
         for gene in consensus_genes:
             if gene.attributes.get('manual_annotation') == 'true':
@@ -4614,19 +4817,35 @@ class GeneAnnotationRefiner:
                 if self.coverage.available:
                     tx = trim_zero_coverage_terminal_exons(
                         tx, self.coverage, gene.seqid, gene.strand)
+                    if self.tracer.matches(gene):
+                        self.tracer.snapshot(
+                            "  Step 5b.1 (trim zero-cov terminal)", [gene])
                     tx = remove_zero_coverage_internal_exons(
                         tx, self.coverage, self.genome, gene.seqid, gene.strand)
+                    if self.tracer.matches(gene):
+                        self.tracer.snapshot(
+                            "  Step 5b.2 (remove zero-cov internal)", [gene])
                 tx.exons = filter_impossible_introns(tx.exons)
+                if self.tracer.matches(gene):
+                    self.tracer.snapshot(
+                        "  Step 5b.3 (filter impossible introns)", [gene])
                 tx.exons = enforce_canonical_splice_sites(
                     self.genome, gene.seqid, tx.exons, gene.strand,
                     bam_evidence=self.bam_evidence)
+                if self.tracer.matches(gene):
+                    self.tracer.snapshot(
+                        "  Step 5b.4 (enforce canonical splice)", [gene])
                 tx.exons = self._remove_noncanonical_exons(
                     gene.seqid, tx.exons, gene.strand)
+                if self.tracer.matches(gene):
+                    self.tracer.snapshot(
+                        "  Step 5b.5 (remove noncanonical exons)", [gene])
             gene.transcripts = deduplicate_isoforms(gene.transcripts)
             gene.transcripts = [
                 tx for tx in gene.transcripts
                 if self._all_splices_canonical(gene.seqid, tx.exons, gene.strand)
             ]
+        self.tracer.snapshot("After Step 5b (post-merge cleanup)", consensus_genes)
 
         # Step 5c: Merge neighboring exons with continuous RNA-seq coverage
         logger.info("\nStep 5c: Merging exons by RNA-seq coverage...")
@@ -4638,6 +4857,7 @@ class GeneAnnotationRefiner:
                     tx.exons = self._merge_exons_by_coverage(
                         gene.seqid, tx.exons, gene.strand)
             gene.transcripts = deduplicate_isoforms(gene.transcripts)
+        self.tracer.snapshot("After Step 5c (merge exons by coverage)", consensus_genes)
 
         # Step 5d: Remove unsupported exons (no RNA-seq coverage AND no ST/TD match)
         logger.info("\nStep 5d: Filtering unsupported exons...")
@@ -4647,10 +4867,16 @@ class GeneAnnotationRefiner:
             for tx in gene.transcripts:
                 tx.exons = self._filter_unsupported_exons(
                     gene.seqid, tx.exons, gene.strand)
+            if self.tracer.matches(gene):
+                self.tracer.snapshot(
+                    "  Step 5d.1 (filter unsupported)", [gene])
             # Remove chimeric exons: internal exons inserted into evidence introns
             for tx in gene.transcripts:
                 tx.exons = self._remove_chimeric_exons(
                     gene.seqid, tx.exons, gene.strand)
+            if self.tracer.matches(gene):
+                self.tracer.snapshot(
+                    "  Step 5d.2 (remove chimeric)", [gene])
             for tx in gene.transcripts:
                 tx.exons = enforce_canonical_splice_sites(
                     self.genome, gene.seqid, tx.exons, gene.strand,
@@ -4660,10 +4886,12 @@ class GeneAnnotationRefiner:
                 tx for tx in gene.transcripts
                 if self._all_splices_canonical(gene.seqid, tx.exons, gene.strand)
             ]
+        self.tracer.snapshot("After Step 5d (filter unsupported exons)", consensus_genes)
 
         # Step 5e: Split non-overlapping isoforms into separate genes
         logger.info("\nStep 5e: Splitting non-overlapping isoforms...")
         consensus_genes = self._split_nonoverlapping_isoforms(consensus_genes)
+        self.tracer.snapshot("After Step 5e (split non-overlapping isoforms)", consensus_genes)
 
         # Step 5f: Rank and select isoforms
         logger.info("\nStep 5f: Ranking isoforms...")
@@ -4672,6 +4900,7 @@ class GeneAnnotationRefiner:
                 continue
             if len(gene.transcripts) > 1:
                 gene.transcripts = self._rank_isoforms(gene)
+        self.tracer.snapshot("After Step 5f (rank isoforms)", consensus_genes)
 
         # Step 5f.5: Upgrade internal exon boundaries using junction evidence.
         # After phase 4 selects the winning template, individual exon boundaries
@@ -4681,6 +4910,7 @@ class GeneAnnotationRefiner:
         # candidate has ≥3× more reads and ≥5 reads.
         logger.info("\nStep 5f.5: Upgrading exon boundaries using junction evidence...")
         self._upgrade_exon_boundaries(consensus_genes)
+        self.tracer.snapshot("After Step 5f.5 (boundary upgrade)", consensus_genes)
 
         # Step 5g: Re-derive CDS from longest ORF in refined transcripts
         logger.info("\nStep 5g: Reassigning CDS from longest ORF...")
@@ -4690,6 +4920,7 @@ class GeneAnnotationRefiner:
                 continue
             gene = orf_finder.reassign_cds(gene, coverage=self.coverage,
                                           evidence_index=self.evidence_index)
+        self.tracer.snapshot("After Step 5g (CDS reassign)", consensus_genes)
 
         # Step 5g.5: Recover downstream exons for genes lacking a stop codon.
         # Now that CDS has been assigned (step 5g), we can detect stop-codon-free genes.
@@ -4705,10 +4936,12 @@ class GeneAnnotationRefiner:
             if gene.attributes.get('_downstream_recovered'):
                 gene = orf_finder.reassign_cds(gene, coverage=self.coverage,
                                               evidence_index=self.evidence_index)
+        self.tracer.snapshot("After Step 5g.5 (downstream recovery)", consensus_genes)
 
         # Step 5h: Split genes where isoforms have non-overlapping CDS
         logger.info("\nStep 5h: Splitting genes with non-overlapping CDS...")
         consensus_genes = self._split_by_cds_overlap(consensus_genes)
+        self.tracer.snapshot("After Step 5h (CDS-overlap split)", consensus_genes)
 
         # Step 5i: Repair transcripts that lost exons during filtering
         logger.info("\nStep 5i: Repairing gene models and recomputing boundaries...")
@@ -4760,6 +4993,7 @@ class GeneAnnotationRefiner:
         n_invalid = before - len(consensus_genes)
         if n_invalid:
             logger.warning(f"  Removed {n_invalid} genes with invalid boundaries")
+        self.tracer.snapshot("After Step 5i (repair/boundaries)", consensus_genes)
 
         # Step 6: Compute posterior probabilities
         logger.info("\nStep 6: Computing posterior probabilities...")
@@ -4790,6 +5024,12 @@ class GeneAnnotationRefiner:
             else:
                 gene.posterior = self.posterior_calc.score_gene(
                     gene, self.helixer_genes, self.td_genes, self.st_genes)
+        if self.tracer.enabled:
+            for g in consensus_genes:
+                if self.tracer.matches(g):
+                    self.tracer.event(
+                        "After Step 6",
+                        f"{g.gene_id} posterior={g.posterior:.3f}")
 
         # Step 7: Filter by posterior threshold
         logger.info("\nStep 7: Applying posterior thresholds...")
@@ -4802,6 +5042,14 @@ class GeneAnnotationRefiner:
                          and g.attributes.get('manual_annotation') != 'true']
         logger.info(f"  {len(passing_genes)} genes pass coding threshold ({self.coding_threshold})")
         logger.info(f"  {len(filtered_genes)} genes removed (low confidence)")
+        if self.tracer.enabled:
+            for g in filtered_genes:
+                if self.tracer.matches(g):
+                    self.tracer.event(
+                        "Step 7 FILTERED",
+                        f"{g.gene_id} dropped (posterior={g.posterior:.3f} "
+                        f"< threshold={self.coding_threshold})")
+            self.tracer.snapshot("After Step 7 (passing)", passing_genes)
 
         # Step 8: Detect ncRNAs
         logger.info("\nStep 8: Detecting ncRNA candidates...")
@@ -4877,6 +5125,7 @@ class GeneAnnotationRefiner:
         logger.info(f"  Protein-coding: {coding_count}")
         logger.info(f"  ncRNA: {ncrna_count}")
 
+        self.tracer.snapshot("Final output (pre-renumber)", all_genes)
         return all_genes
 
     def _all_splices_canonical(self, seqid: str, exons: List[Feature],
@@ -6062,6 +6311,21 @@ class GeneAnnotationRefiner:
 
         logger.info(f"  Candidate exons after dedup: {len(candidate_exons)}")
 
+        # Phase 1 trace: dump candidate exons overlapping any --trace_region
+        if self.tracer.enabled and self.tracer.regions:
+            for (seqid, strand), _ in exon_pool_by_region.items():
+                in_region = sorted(
+                    (k[2], k[3], info['sources']) for k, info
+                    in candidate_exons.items()
+                    if k[0] == seqid and k[1] == strand
+                    and self.tracer.region_overlaps(seqid, k[2], k[3]))
+                if in_region:
+                    logger.info(
+                        f"[TRACE] Phase 1 pool | {seqid}({strand}) | "
+                        f"{len(in_region)} candidate exons in trace region")
+                    for s, e, sources in in_region[:40]:
+                        logger.info(f"[TRACE]   {s}-{e} sources={sorted(sources)}")
+
         # ================================================================
         # Phase 2: Score each candidate exon
         # ================================================================
@@ -6704,6 +6968,17 @@ class GeneAnnotationRefiner:
 
         logger.info(f"  Assembled {len(assembled_genes)} template-based gene models")
 
+        # Phase 3 trace: show candidate assembled models for target loci
+        if self.tracer.enabled:
+            for score, g in assembled_genes:
+                if self.tracer.matches(g):
+                    logger.info(
+                        f"[TRACE] Phase 3 candidate | "
+                        f"src={g.attributes.get('evidence_sources', '?')} "
+                        f"score={score:.3f} "
+                        f"junc={g.attributes.get('_n_junc_supported', 0)}")
+                    self.tracer.snapshot("Phase 3 candidate", [g])
+
         # ================================================================
         # Phase 4: Resolve overlapping templates — keep the best
         # ================================================================
@@ -6744,6 +7019,7 @@ class GeneAnnotationRefiner:
 
         logger.info(f"  Selected {len(selected)} non-overlapping gene models "
                    f"(from {len(assembled_genes)} candidates)")
+        self.tracer.snapshot("After Phase 4 (selected)", selected)
 
         # ================================================================
         # Phase 5: Trim zero-coverage terminal exons
@@ -6754,6 +7030,7 @@ class GeneAnnotationRefiner:
                     tx, self.coverage, gene.seqid, gene.strand)
 
         consensus = selected
+        self.tracer.snapshot("After Phase 5 (terminal exon trim)", consensus)
         return consensus
 
     @staticmethod
@@ -7102,7 +7379,14 @@ class GeneAnnotationRefiner:
 
                 if self.merger.should_merge(current, candidate):
                     logger.info(f"Merging {current.gene_id} + {candidate.gene_id}")
+                    if self.tracer.enabled and self.tracer.pair_matches(current, candidate):
+                        self.tracer.event(
+                            "Step 5 merge",
+                            f"MERGING {current.gene_id} + {candidate.gene_id} "
+                            f"at gap {current.end + 1}-{candidate.start - 1}")
                     current = self.merger.merge_genes(current, candidate)
+                    if self.tracer.matches(current):
+                        self.tracer.snapshot("Step 5 post-merge", [current])
                     merged_set.add(j)
                     merge_count += 1
 
@@ -7508,6 +7792,23 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
                              'straightforward.  Lower values retain more candidate '
                              'models; raise to 0.50 for a higher-confidence set.')
 
+    # Debug / tracing
+    trace_group = parser.add_argument_group(
+        'Debug tracing',
+        'Follow one or more genes through every pipeline step.  Matching '
+        'is by substring, so passing a short prefix like "005173" matches '
+        '"Apis_helixer_scaffold_2_005173.1" and any refined gene that '
+        'inherited it via the merge trail.  When the refined/renumbered '
+        'ID is all that is known, use --trace_region to follow a locus.  '
+        'All trace output is prefixed with "[TRACE]".')
+    trace_group.add_argument(
+        '--trace_gene', action='append', default=[], metavar='GENE_ID',
+        help='Gene ID (or substring) to trace.  Repeat for multiple genes.')
+    trace_group.add_argument(
+        '--trace_region', action='append', default=[], metavar='SEQID:START-END',
+        help='Genomic region to trace (e.g. scaffold_2:77600000-77680000). '
+             'Any gene overlapping the region is traced.  Repeatable.')
+
     # Handle --dump_config before dep check (no deps needed)
     if '--dump_config' in sys.argv:
         cfg = ScoringConfig()
@@ -7581,6 +7882,15 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
     scoring_config.validate_weights()
     scoring_config.log_active_config()
 
+    # Build the gene tracer from --trace_gene / --trace_region flags
+    trace_regions = []
+    for r in args.trace_region or []:
+        try:
+            trace_regions.append(GeneTracer.parse_region(r))
+        except ValueError as e:
+            parser.error(str(e))
+    tracer = GeneTracer(gene_ids=args.trace_gene or [], regions=trace_regions)
+
     refiner = GeneAnnotationRefiner(
         genome_path=args.genome,
         helixer_path=args.helixer if not args.refine_existing else None,
@@ -7593,6 +7903,7 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         refine_existing_path=args.refine_existing,
         scoring_config=scoring_config,
         pwm_organism=args.pwm_organism,
+        tracer=tracer,
     )
 
     refined_genes = refiner.refine()
@@ -7607,6 +7918,7 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
             logger.info(f"  Loaded {len(name_from_genes)} reference gene names")
         refined_genes = renumber_genes(refined_genes, prefix=args.gene_prefix,
                                        name_from_genes=name_from_genes)
+        tracer.snapshot("After renumber", refined_genes)
 
     write_refined_gff(refined_genes, args.output)
     print_summary(refined_genes)
