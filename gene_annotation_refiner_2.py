@@ -1975,7 +1975,7 @@ class ORFFinder:
                 phase = (3 - (cds_bases_so_far % 3)) % 3
 
                 cds_features.append(Feature(
-                    seqid=seqid, source='Refined', ftype='CDS',
+                    seqid=seqid, source='.', ftype='CDS',
                     start=g_start, end=g_end,
                     score=0.0, strand=strand, phase=phase,
                     attributes={'Parent': ''}
@@ -2033,45 +2033,45 @@ class ORFFinder:
             if strand == '+':
                 if exon.end < cds_start:
                     tx.five_prime_utrs.append(Feature(
-                        seqid=exon.seqid, source='Refined', ftype='five_prime_UTR',
+                        seqid=exon.seqid, source='.', ftype='five_prime_UTR',
                         start=exon.start, end=exon.end, score=0, strand=strand,
                         phase='.', attributes=exon.attributes))
                 elif exon.start < cds_start <= exon.end:
                     if cds_start - 1 >= exon.start:
                         tx.five_prime_utrs.append(Feature(
-                            seqid=exon.seqid, source='Refined', ftype='five_prime_UTR',
+                            seqid=exon.seqid, source='.', ftype='five_prime_UTR',
                             start=exon.start, end=cds_start - 1, score=0, strand=strand,
                             phase='.', attributes=exon.attributes))
                 if exon.start > cds_end:
                     tx.three_prime_utrs.append(Feature(
-                        seqid=exon.seqid, source='Refined', ftype='three_prime_UTR',
+                        seqid=exon.seqid, source='.', ftype='three_prime_UTR',
                         start=exon.start, end=exon.end, score=0, strand=strand,
                         phase='.', attributes=exon.attributes))
                 elif exon.start <= cds_end < exon.end:
                     tx.three_prime_utrs.append(Feature(
-                        seqid=exon.seqid, source='Refined', ftype='three_prime_UTR',
+                        seqid=exon.seqid, source='.', ftype='three_prime_UTR',
                         start=cds_end + 1, end=exon.end, score=0, strand=strand,
                         phase='.', attributes=exon.attributes))
             else:
                 if exon.start > cds_end:
                     tx.five_prime_utrs.append(Feature(
-                        seqid=exon.seqid, source='Refined', ftype='five_prime_UTR',
+                        seqid=exon.seqid, source='.', ftype='five_prime_UTR',
                         start=exon.start, end=exon.end, score=0, strand=strand,
                         phase='.', attributes=exon.attributes))
                 elif exon.start <= cds_end < exon.end:
                     tx.five_prime_utrs.append(Feature(
-                        seqid=exon.seqid, source='Refined', ftype='five_prime_UTR',
+                        seqid=exon.seqid, source='.', ftype='five_prime_UTR',
                         start=cds_end + 1, end=exon.end, score=0, strand=strand,
                         phase='.', attributes=exon.attributes))
                 if exon.end < cds_start:
                     tx.three_prime_utrs.append(Feature(
-                        seqid=exon.seqid, source='Refined', ftype='three_prime_UTR',
+                        seqid=exon.seqid, source='.', ftype='three_prime_UTR',
                         start=exon.start, end=exon.end, score=0, strand=strand,
                         phase='.', attributes=exon.attributes))
                 elif exon.start < cds_start <= exon.end:
                     if cds_start - 1 >= exon.start:
                         tx.three_prime_utrs.append(Feature(
-                            seqid=exon.seqid, source='Refined', ftype='three_prime_UTR',
+                            seqid=exon.seqid, source='.', ftype='three_prime_UTR',
                             start=exon.start, end=cds_start - 1, score=0, strand=strand,
                             phase='.', attributes=exon.attributes))
 
@@ -2305,7 +2305,7 @@ def filter_impossible_introns(exons: List[Feature],
         if gap < min_intron:
             # Merge: extend previous exon to cover both
             result[-1] = Feature(
-                seqid=prev.seqid, source='Refined', ftype='exon',
+                seqid=prev.seqid, source='.', ftype='exon',
                 start=prev.start, end=max(prev.end, exon.end),
                 score=prev.score, strand=prev.strand, phase=prev.phase,
                 attributes=prev.attributes
@@ -3496,7 +3496,7 @@ class GeneMerger:
             strand=gene_a.strand,
             start=new_start,
             end=new_end,
-            source='Refined',
+            source='.',
             attributes={'ID': new_id,
                        'merged_from': merge_trail}
         )
@@ -3512,7 +3512,7 @@ class GeneMerger:
                 strand=gene_a.strand,
                 start=new_start,
                 end=new_end,
-                source='Refined'
+                source='.'
             )
             merged_tx.exons = self._deduplicate_features(tx_a.exons + tx_b.exons)
             merged_tx.cds = self._deduplicate_features(tx_a.cds + tx_b.cds)
@@ -3618,7 +3618,7 @@ class UTRRecovery:
                                             f"support on intron {intron_s}-{intron_e}")
                                         continue
                                 utr = Feature(
-                                    seqid=refined_gene.seqid, source='Refined',
+                                    seqid=refined_gene.seqid, source='.',
                                     ftype='five_prime_UTR', start=exon.start,
                                     end=exon.end, score=0.0, strand=refined_gene.strand,
                                     phase='.', attributes={}
@@ -3627,7 +3627,7 @@ class UTRRecovery:
                                 # Also add as exon if not already present
                                 if not any(abs(e.start - exon.start) < 5 for e in tx.exons):
                                     new_exon = Feature(
-                                        seqid=refined_gene.seqid, source='Refined',
+                                        seqid=refined_gene.seqid, source='.',
                                         ftype='exon', start=exon.start, end=exon.end,
                                         score=0.0, strand=refined_gene.strand,
                                         phase='.', attributes={}
@@ -3644,7 +3644,7 @@ class UTRRecovery:
                                 refined_gene.seqid, exon.start, exon.end)
                             if cov > 2.0:
                                 utr = Feature(
-                                    seqid=refined_gene.seqid, source='Refined',
+                                    seqid=refined_gene.seqid, source='.',
                                     ftype='three_prime_UTR', start=exon.start,
                                     end=exon.end, score=0.0, strand=refined_gene.strand,
                                     phase='.', attributes={}
@@ -3652,7 +3652,7 @@ class UTRRecovery:
                                 tx.three_prime_utrs.append(utr)
                                 if not any(abs(e.start - exon.start) < 5 for e in tx.exons):
                                     new_exon = Feature(
-                                        seqid=refined_gene.seqid, source='Refined',
+                                        seqid=refined_gene.seqid, source='.',
                                         ftype='exon', start=exon.start, end=exon.end,
                                         score=0.0, strand=refined_gene.strand,
                                         phase='.', attributes={}
@@ -3689,7 +3689,7 @@ class UTRRecovery:
                                             f"no junction on intron {intron_s}-{intron_e}")
                                         continue
                                 utr = Feature(
-                                    seqid=refined_gene.seqid, source='Refined',
+                                    seqid=refined_gene.seqid, source='.',
                                     ftype='five_prime_UTR', start=exon.start,
                                     end=exon.end, score=0.0, strand=refined_gene.strand,
                                     phase='.', attributes={}
@@ -3697,7 +3697,7 @@ class UTRRecovery:
                                 tx.five_prime_utrs.append(utr)
                                 if not any(abs(e.start - exon.start) < 5 for e in tx.exons):
                                     new_exon = Feature(
-                                        seqid=refined_gene.seqid, source='Refined',
+                                        seqid=refined_gene.seqid, source='.',
                                         ftype='exon', start=exon.start, end=exon.end,
                                         score=0.0, strand=refined_gene.strand,
                                         phase='.', attributes={}
@@ -3713,7 +3713,7 @@ class UTRRecovery:
                                 refined_gene.seqid, exon.start, exon.end)
                             if cov > 2.0:
                                 utr = Feature(
-                                    seqid=refined_gene.seqid, source='Refined',
+                                    seqid=refined_gene.seqid, source='.',
                                     ftype='three_prime_UTR', start=exon.start,
                                     end=exon.end, score=0.0, strand=refined_gene.strand,
                                     phase='.', attributes={}
@@ -3721,7 +3721,7 @@ class UTRRecovery:
                                 tx.three_prime_utrs.append(utr)
                                 if not any(abs(e.start - exon.start) < 5 for e in tx.exons):
                                     new_exon = Feature(
-                                        seqid=refined_gene.seqid, source='Refined',
+                                        seqid=refined_gene.seqid, source='.',
                                         ftype='exon', start=exon.start, end=exon.end,
                                         score=0.0, strand=refined_gene.strand,
                                         phase='.', attributes={}
@@ -3823,7 +3823,7 @@ class ncRNADetector:
                 strand=st_gene.strand,
                 start=st_gene.start,
                 end=st_gene.end,
-                source='Refined',
+                source='.',
                 gene_type='ncRNA',
                 attributes={
                     'ID': f"ncRNA_{st_gene.gene_id}",
@@ -3839,10 +3839,10 @@ class ncRNADetector:
                 strand=st_gene.strand,
                 start=st_gene.start,
                 end=st_gene.end,
-                source='Refined'
+                source='.'
             )
             ncrna_tx.exons = [Feature(
-                seqid=e.seqid, source='Refined', ftype='exon',
+                seqid=e.seqid, source='.', ftype='exon',
                 start=e.start, end=e.end, score=e.score,
                 strand=e.strand, phase='.', attributes={}
             ) for e in tx.exons]
@@ -4514,7 +4514,7 @@ class SpliceSiteEvaluator:
                 if gene.strand == '+':
                     # Merge first exon into UTR, extending gene model
                     merged_exon = Feature(
-                        seqid=gene.seqid, source='Refined', ftype='exon',
+                        seqid=gene.seqid, source='.', ftype='exon',
                         start=first_exon.start, end=second_exon.end,
                         score=0.0, strand=gene.strand, phase='.', attributes={}
                     )
@@ -4524,7 +4524,7 @@ class SpliceSiteEvaluator:
                     first_cds = cds[0]
                     if first_exon.start < first_cds.start:
                         utr = Feature(
-                            seqid=gene.seqid, source='Refined',
+                            seqid=gene.seqid, source='.',
                             ftype='five_prime_UTR',
                             start=first_exon.start, end=min(intron_end, first_cds.start - 1),
                             score=0.0, strand=gene.strand, phase='.', attributes={}
@@ -4695,7 +4695,7 @@ class GeneAnnotationRefiner:
                 strand=mg.strand,
                 start=mg.start,
                 end=mg.end,
-                source='Refined',
+                source='.',
                 attributes=dict(mg.attributes)
             )
             manual_gene.attributes['manual_annotation'] = 'true'
@@ -4708,7 +4708,7 @@ class GeneAnnotationRefiner:
                     strand=mtx.strand,
                     start=mtx.start,
                     end=mtx.end,
-                    source='Refined'
+                    source='.'
                 )
                 ctx.exons = list(mtx.exons)
                 ctx.cds = list(mtx.cds)
@@ -4806,7 +4806,7 @@ class GeneAnnotationRefiner:
                     strand=eg.strand,
                     start=eg.start,
                     end=eg.end,
-                    source='Refined',
+                    source='.',
                     attributes=dict(eg.attributes)
                 )
                 cgene.attributes['evidence_sources'] = 'Existing'
@@ -4817,7 +4817,7 @@ class GeneAnnotationRefiner:
                         strand=etx.strand,
                         start=etx.start,
                         end=etx.end,
-                        source='Refined'
+                        source='.'
                     )
                     ctx.exons = list(etx.exons)
                     ctx.cds = list(etx.cds)
@@ -5108,7 +5108,7 @@ class GeneAnnotationRefiner:
                         else:
                             exon_regions.append((c.start, c.end))
                     tx.exons = [
-                        Feature(seqid=gene.seqid, source='Refined', ftype='exon',
+                        Feature(seqid=gene.seqid, source='.', ftype='exon',
                                 start=s, end=e, score=0.0, strand=gene.strand,
                                 phase='.', attributes={})
                         for s, e in exon_regions
@@ -6231,7 +6231,7 @@ class GeneAnnotationRefiner:
                         break
 
                     new_exon = Feature(
-                        seqid=seqid, source='Refined', ftype='exon',
+                        seqid=seqid, source='.', ftype='exon',
                         start=exon_start, end=exon_end,
                         score=0.5, strand=strand,
                         phase='.', attributes={'sources': 'junction_recovery'})
@@ -6660,7 +6660,7 @@ class GeneAnnotationRefiner:
                     s, e, sc, src, cov = match
                     # src is already a frozenset of independent tool sources
                     gene_exons.append(Feature(
-                        seqid=seqid, source='Refined', ftype='exon',
+                        seqid=seqid, source='.', ftype='exon',
                         start=s, end=e, score=sc, strand=strand,
                         phase='.', attributes={
                             'sources': ','.join(sorted(src))
@@ -6671,7 +6671,7 @@ class GeneAnnotationRefiner:
                 else:
                     # Template exon not in pool (shouldn't happen, but safety)
                     gene_exons.append(Feature(
-                        seqid=seqid, source='Refined', ftype='exon',
+                        seqid=seqid, source='.', ftype='exon',
                         start=texon.start, end=texon.end, score=0.1,
                         strand=strand, phase='.',
                         attributes={'sources': source_label}
@@ -6902,7 +6902,7 @@ class GeneAnnotationRefiner:
                                 continue
 
                         new_exon = Feature(
-                            seqid=seqid, source='Refined', ftype='exon',
+                            seqid=seqid, source='.', ftype='exon',
                             start=ps, end=pe, score=psc, strand=strand,
                             phase='.', attributes={
                                 'sources': ','.join(sorted(psrc)),
@@ -7033,7 +7033,7 @@ class GeneAnnotationRefiner:
                 strand=strand,
                 start=gene_start,
                 end=gene_end,
-                source='Refined',
+                source='.',
                 attributes={
                     'ID': f"consensus_{source_label}_{template.gene_id}",
                     'template_source': source_label,
@@ -7046,7 +7046,7 @@ class GeneAnnotationRefiner:
                 transcript_id=f"{cgene.gene_id}.1",
                 seqid=seqid, strand=strand,
                 start=gene_start, end=gene_end,
-                source='Refined'
+                source='.'
             )
             ctx.exons = gene_exons
 
@@ -7457,7 +7457,7 @@ class GeneAnnotationRefiner:
                     new_end = best_match.end
 
                 refined_exon = Feature(
-                    seqid=exon.seqid, source='Refined', ftype='exon',
+                    seqid=exon.seqid, source='.', ftype='exon',
                     start=new_start, end=new_end, score=exon.score,
                     strand=exon.strand, phase=exon.phase, attributes=exon.attributes
                 )
@@ -7600,7 +7600,7 @@ class GeneAnnotationRefiner:
             new_gene = Gene(
                 gene_id=f"{gene.gene_id}_split{ci + 1}",
                 seqid=gene.seqid, strand=gene.strand,
-                start=cl_start, end=cl_end, source='Refined',
+                start=cl_start, end=cl_end, source='.',
                 attributes=dict(gene.attributes)
             )
             new_gene.attributes['ID'] = new_gene.gene_id
@@ -7617,7 +7617,7 @@ class GeneAnnotationRefiner:
                     seqid=gene.seqid, strand=gene.strand,
                     start=min(e.start for e in cluster_exons),
                     end=max(e.end for e in cluster_exons),
-                    source='Refined'
+                    source='.'
                 )
                 new_tx.exons = cluster_exons
                 new_tx.cds = [c for c in tx.cds
@@ -7810,14 +7810,14 @@ class GeneAnnotationRefiner:
                 seqid=gene.seqid, strand=gene.strand,
                 start=min(e.start for e in exons),
                 end=max(e.end for e in exons),
-                source='Refined',
+                source='.',
                 attributes=dict(gene.attributes))
             new_gene.attributes['ID'] = new_gene.gene_id
             new_gene.attributes['split_from'] = gene.gene_id
             new_tx = Transcript(
                 transcript_id=f"{new_gene.gene_id}.1",
                 seqid=gene.seqid, strand=gene.strand,
-                start=new_gene.start, end=new_gene.end, source='Refined')
+                start=new_gene.start, end=new_gene.end, source='.')
             new_tx.exons = list(exons)
             new_gene.transcripts.append(new_tx)
 
@@ -8040,14 +8040,14 @@ def write_refined_gff(genes: List[Gene], output_path: str):
                 if 'FPKM' in gene.attributes:
                     gene_attrs += f";FPKM={gene.attributes['FPKM']}"
 
-            f.write(f"{gene.seqid}\tRefined\tgene\t{gene.start}\t{gene.end}\t"
+            f.write(f"{gene.seqid}\t.\tgene\t{gene.start}\t{gene.end}\t"
                    f"{gene.posterior:.4f}\t{gene.strand}\t.\t{gene_attrs}\n")
 
             for tx in gene.transcripts:
                 # mRNA/transcript line
                 tx_type = 'mRNA' if gene.gene_type == 'protein_coding' else 'transcript'
                 tx_attrs = f"ID={tx.transcript_id};Parent={gene.gene_id}"
-                f.write(f"{gene.seqid}\tRefined\t{tx_type}\t{tx.start}\t{tx.end}\t"
+                f.write(f"{gene.seqid}\t.\t{tx_type}\t{tx.start}\t{tx.end}\t"
                        f"{gene.posterior:.4f}\t{gene.strand}\t.\t{tx_attrs}\n")
 
                 # Exons (sorted by position)
@@ -8056,26 +8056,26 @@ def write_refined_gff(genes: List[Gene], output_path: str):
                     exon_attrs = (f"ID={tx.transcript_id}.exon.{i};"
                                  f"Parent={tx.transcript_id};"
                                  f"exon_posterior={post}")
-                    f.write(f"{gene.seqid}\tRefined\texon\t{exon.start}\t{exon.end}\t"
+                    f.write(f"{gene.seqid}\t.\texon\t{exon.start}\t{exon.end}\t"
                            f"{exon.score:.4f}\t{gene.strand}\t.\t{exon_attrs}\n")
 
                 # 5' UTRs
                 for i, utr in enumerate(sorted(tx.five_prime_utrs, key=lambda u: u.start), 1):
                     utr_attrs = f"ID={tx.transcript_id}.five_prime_UTR.{i};Parent={tx.transcript_id}"
-                    f.write(f"{gene.seqid}\tRefined\tfive_prime_UTR\t{utr.start}\t{utr.end}\t"
+                    f.write(f"{gene.seqid}\t.\tfive_prime_UTR\t{utr.start}\t{utr.end}\t"
                            f".\t{gene.strand}\t.\t{utr_attrs}\n")
 
                 # CDS features
                 for i, cds in enumerate(sorted(tx.cds, key=lambda c: c.start), 1):
                     cds_attrs = f"ID={tx.transcript_id}.CDS.{i};Parent={tx.transcript_id}"
                     phase = cds.phase if cds.phase in ('0', '1', '2') else '.'
-                    f.write(f"{gene.seqid}\tRefined\tCDS\t{cds.start}\t{cds.end}\t"
+                    f.write(f"{gene.seqid}\t.\tCDS\t{cds.start}\t{cds.end}\t"
                            f"{cds.score:.4f}\t{gene.strand}\t{phase}\t{cds_attrs}\n")
 
                 # 3' UTRs
                 for i, utr in enumerate(sorted(tx.three_prime_utrs, key=lambda u: u.start), 1):
                     utr_attrs = f"ID={tx.transcript_id}.three_prime_UTR.{i};Parent={tx.transcript_id}"
-                    f.write(f"{gene.seqid}\tRefined\tthree_prime_UTR\t{utr.start}\t{utr.end}\t"
+                    f.write(f"{gene.seqid}\t.\tthree_prime_UTR\t{utr.start}\t{utr.end}\t"
                            f".\t{gene.strand}\t.\t{utr_attrs}\n")
 
     logger.info(f"Wrote refined GFF to {output_path}")
