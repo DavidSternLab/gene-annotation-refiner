@@ -3,10 +3,8 @@
 Gene Annotation Refiner
 =======================
 Integrates multiple evidence sources (Helixer ML predictions, StringTie RNA-seq
-transcripts, TransDecoder CDS predictions, RNA-seq coverage, human-curated models)
-to produce a refined GFF file with posterior probabilities for all features.
-
-Designed for insect genomes (tested on Oncopeltus fasciatus) but generalizable.
+transcripts, TransDecoder CDS predictions, RNA-seq coverage and junctions, and 
+human-curated models) to produce a refined GFF file with scores (0-1) for all features.
 
 Mode 1 — Full consensus (default):
     python gene_annotation_refiner.py \
@@ -19,10 +17,20 @@ Mode 1 — Full consensus (default):
         [--manual_annotation manual.gff] \
         [--bam rnaseq.bam | --junctions junctions.tab]
 
-Mode 2 — Refine an existing annotation:
+Mode 2 — Replace an existing annotation with manual annotations:
     python gene_annotation_refiner.py \
         --genome genome.fa \
         --refine_existing previous.gff \
+        --manual_annotation manual.gff \
+        --output refined_annotation.gff
+    Trusts the existing annotation; manual genes replace overlapping ones.
+    No evidence-based refinement is run.
+
+Mode 2b — Same as Mode 2, plus RNA-seq evidence-based refinement:
+    python gene_annotation_refiner.py \
+        --genome genome.fa \
+        --refine_existing previous.gff \
+        --refine_with_evidence \
         --bigwig rnaseq.bw \
         --output refined_annotation.gff \
         [--manual_annotation manual.gff] \
@@ -4546,6 +4554,7 @@ class GeneAnnotationRefiner:
                  junctions_path: str = None,
                  manual_annotation_path: str = None,
                  refine_existing_path: str = None,
+                 evidence_refinement: bool = True,
                  scoring_config: 'ScoringConfig' = None,
                  pwm_organism: str = 'drosophila',
                  tracer: 'GeneTracer' = None):
@@ -4565,6 +4574,10 @@ class GeneAnnotationRefiner:
 
         # Mode flag: refine-existing skips consensus building
         self.refine_existing_mode = refine_existing_path is not None
+        # Whether to apply evidence-based refinement steps (junction validation,
+        # coverage trimming, etc.). In refine-existing mode, default is to trust
+        # the existing annotation and skip these steps unless explicitly requested.
+        self.evidence_refinement = evidence_refinement
 
         # Parse input annotations (all optional)
         self.helixer_genes = []
@@ -4833,6 +4846,13 @@ class GeneAnnotationRefiner:
             if self.manual_genes:
                 consensus_genes = self._incorporate_manual_genes(consensus_genes)
                 self.tracer.snapshot("After manual incorporation", consensus_genes)
+
+            if not self.evidence_refinement:
+                logger.info("\nSkipping evidence-based refinement "
+                            "(use --refine_with_evidence to enable).")
+                logger.info(f"  Returning {len(consensus_genes)} gene models "
+                            "from existing+manual annotation as-is.")
+                return consensus_genes
 
         else:
             # --- Full consensus mode ---
@@ -8270,9 +8290,18 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
                                 'confidence; UTR ends remain low confidence since '
                                 'these are often estimated approximately.')
     gff_group.add_argument('--refine_existing', default=None,
-                           help='Refine an existing annotation GFF3 with RNA-seq '
-                                'data instead of building consensus from '
-                                'helixer/stringtie/transdecoder.')
+                           help='Use an existing annotation GFF3 as the base '
+                                'instead of building consensus from '
+                                'helixer/stringtie/transdecoder. By default the '
+                                'existing annotation is trusted and only manual '
+                                'annotations replace overlapping genes; pass '
+                                '--refine_with_evidence to also run RNA-seq '
+                                'evidence-based refinement steps.')
+    gff_group.add_argument('--refine_with_evidence', action='store_true',
+                           help='In --refine_existing mode, additionally run '
+                                'evidence-based refinement (junction validation, '
+                                'coverage trimming, canonical splice enforcement, '
+                                'etc.). Requires --bigwig.')
 
     # Evidence data
     parser.add_argument('--bigwig', default=None,
@@ -8390,6 +8419,12 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         logger.warning("--refine_existing mode: ignoring --helixer, --stringtie, "
                       "and --transdecoder (using existing annotation as base)")
 
+    # Validate: --refine_with_evidence requires --refine_existing
+    if args.refine_with_evidence and not args.refine_existing:
+        parser.error("--refine_with_evidence requires --refine_existing")
+    if args.refine_with_evidence and not args.bigwig:
+        parser.error("--refine_with_evidence requires --bigwig")
+
     # Validate: --name_from requires --renumber
     if args.name_from and not args.renumber:
         parser.error("--name_from requires --renumber")
@@ -8427,6 +8462,7 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         junctions_path=args.junctions,
         manual_annotation_path=args.manual_annotation,
         refine_existing_path=args.refine_existing,
+        evidence_refinement=(not args.refine_existing) or args.refine_with_evidence,
         scoring_config=scoring_config,
         pwm_organism=args.pwm_organism,
         tracer=tracer,
