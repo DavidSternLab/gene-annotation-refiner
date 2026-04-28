@@ -2853,6 +2853,34 @@ class CoverageAccess:
         self.bw.close()
 
 
+class StrandedCoverage:
+    """Optional same-strand coverage from forward/reverse bigwigs.
+
+    Used to veto unstranded-coverage support that may actually be
+    antisense reads from a neighboring gene. Bigwigs are expected to be
+    keyed by transcript strand (e.g. produced via deepTools
+    `bamCoverage --filterRNAstrand forward/reverse`).
+    """
+
+    def __init__(self, fwd_path: str = None, rev_path: str = None):
+        self.fwd = CoverageAccess(fwd_path) if fwd_path else None
+        self.rev = CoverageAccess(rev_path) if rev_path else None
+        self.available = self.fwd is not None and self.rev is not None
+
+    def sense_mean(self, seqid: str, start: int, end: int, strand: str) -> float:
+        """Mean same-strand coverage. Returns None if stranded data unavailable."""
+        if not self.available:
+            return None
+        bw = self.fwd if strand == '+' else self.rev
+        return bw.get_mean_coverage(seqid, start, end)
+
+    def close(self):
+        if self.fwd:
+            self.fwd.close()
+        if self.rev:
+            self.rev.close()
+
+
 class NoCoverageAccess:
     """Stub class when no bigwig file is provided.
     Returns neutral/zero values for all coverage queries."""
@@ -4551,6 +4579,7 @@ class GeneAnnotationRefiner:
     def __init__(self, genome_path: str, helixer_path: str = None,
                  stringtie_path: str = None, transdecoder_path: str = None,
                  bigwig_path: str = None, bam_path: str = None,
+                 bigwig_fwd_path: str = None, bigwig_rev_path: str = None,
                  junctions_path: str = None,
                  manual_annotation_path: str = None,
                  refine_existing_path: str = None,
@@ -4560,6 +4589,11 @@ class GeneAnnotationRefiner:
                  tracer: 'GeneTracer' = None):
         self.genome = GenomeAccess(genome_path)
         self.coverage = CoverageAccess(bigwig_path) if bigwig_path else NoCoverageAccess()
+        self.stranded_coverage = StrandedCoverage(bigwig_fwd_path, bigwig_rev_path)
+        if self.stranded_coverage.available:
+            logger.info("Stranded coverage available — will be used to veto "
+                        "antisense-driven UTR extension and downstream-exon "
+                        "recovery.")
         self.cfg = scoring_config or ScoringConfig()
         self.pwm_organism = pwm_organism
         self.tracer = tracer or GeneTracer()
@@ -6250,6 +6284,16 @@ class GeneAnnotationRefiner:
                             f"{cov_floor * 0.15:.1f}, floor={cov_floor:.1f})")
                         break
 
+                    # Stranded veto: if same-strand coverage is near-zero,
+                    # the unstranded support is antisense from a neighbor.
+                    if not self._passes_strand_check(
+                            seqid, exon_start, exon_end, strand, exon_cov):
+                        logger.info(
+                            f"  Downstream exon {exon_start}-{exon_end} for "
+                            f"{gene.gene_id} rejected as antisense "
+                            f"(stranded veto)")
+                        break
+
                     new_exon = Feature(
                         seqid=seqid, source='Refined', ftype='exon',
                         start=exon_start, end=exon_end,
@@ -6293,6 +6337,24 @@ class GeneAnnotationRefiner:
 
         if n_recovered:
             logger.info(f"  Recovered downstream exons for {n_recovered} gene(s)")
+
+    def _passes_strand_check(self, seqid: str, start: int, end: int,
+                              strand: str, unstranded_mean: float) -> bool:
+        """Veto unstranded support that looks like antisense leakage.
+
+        Returns True if stranded data is unavailable (no veto) or if the
+        same-strand mean is at least max(0.5, 0.10 * unstranded_mean).
+        Same-strand below that threshold means the unstranded signal is
+        dominated by antisense reads from a neighbor, so the support is
+        rejected.
+        """
+        if not self.stranded_coverage.available:
+            return True
+        sense = self.stranded_coverage.sense_mean(seqid, start, end, strand)
+        if sense is None:
+            return True
+        thresh = max(0.5, 0.10 * unstranded_mean)
+        return sense >= thresh
 
     @staticmethod
     def _recompute_gene_boundaries(gene: Gene):
@@ -7285,6 +7347,13 @@ class GeneAnnotationRefiner:
                     if any(os_ <= ext_end and oe_ >= ext_start
                            for (_g, os_, oe_) in others):
                         continue
+                    if not self._passes_strand_check(
+                            gene.seqid, ext_start, ext_end, gene.strand, ext_cov):
+                        if self.tracer.enabled and self.tracer.matches(gene):
+                            logger.info(
+                                f"[TRACE] Phase 4.5 reject low-end (antisense) | "
+                                f"{gene.gene_id} | candidate {pstart}-{original_start - 1}")
+                        continue
                     best_start = pstart
 
                 if best_start < original_start:
@@ -7326,6 +7395,13 @@ class GeneAnnotationRefiner:
                         continue
                     if any(os_ <= ext_end and oe_ >= ext_start
                            for (_g, os_, oe_) in others):
+                        continue
+                    if not self._passes_strand_check(
+                            gene.seqid, ext_start, ext_end, gene.strand, ext_cov):
+                        if self.tracer.enabled and self.tracer.matches(gene):
+                            logger.info(
+                                f"[TRACE] Phase 4.5 reject high-end (antisense) | "
+                                f"{gene.gene_id} | candidate {original_end + 1}-{pend}")
                         continue
                     best_end = pend
 
@@ -8305,7 +8381,23 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
 
     # Evidence data
     parser.add_argument('--bigwig', default=None,
-                        help='RNA-seq coverage bigwig (recommended)')
+                        help='RNA-seq coverage bigwig (recommended). Built from '
+                             'all libraries (stranded + unstranded) — used as '
+                             'the primary coverage signal throughout the pipeline.')
+    parser.add_argument('--bigwig_fwd', default=None,
+                        help='Optional same-strand bigwig for transcripts on '
+                             'the + strand (e.g. deepTools '
+                             '`bamCoverage --filterRNAstrand forward` from '
+                             'stranded libraries only). Used as a veto: if '
+                             'same-strand coverage is near-zero where the '
+                             'unstranded bigwig shows support, the support is '
+                             'rejected as antisense leakage. Currently applied '
+                             'in Phase 4.5 (terminal-exon UTR extension) and '
+                             'Step 5g.5 (downstream-exon recovery). Requires '
+                             '--bigwig_rev.')
+    parser.add_argument('--bigwig_rev', default=None,
+                        help='Same-strand bigwig for transcripts on the − strand. '
+                             'Pairs with --bigwig_fwd.')
     parser.add_argument('--bam', default=None,
                         help='RNA-seq BAM file (optional, for splice junction evidence)')
     parser.add_argument('--junctions', default=None,
@@ -8419,6 +8511,10 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         logger.warning("--refine_existing mode: ignoring --helixer, --stringtie, "
                       "and --transdecoder (using existing annotation as base)")
 
+    # Validate: stranded bigwigs come as a pair
+    if bool(args.bigwig_fwd) != bool(args.bigwig_rev):
+        parser.error("--bigwig_fwd and --bigwig_rev must be provided together")
+
     # Validate: --refine_with_evidence requires --refine_existing
     if args.refine_with_evidence and not args.refine_existing:
         parser.error("--refine_with_evidence requires --refine_existing")
@@ -8458,6 +8554,8 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         stringtie_path=args.stringtie if not args.refine_existing else None,
         transdecoder_path=args.transdecoder if not args.refine_existing else None,
         bigwig_path=args.bigwig,
+        bigwig_fwd_path=args.bigwig_fwd,
+        bigwig_rev_path=args.bigwig_rev,
         bam_path=args.bam,
         junctions_path=args.junctions,
         manual_annotation_path=args.manual_annotation,
