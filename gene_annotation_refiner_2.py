@@ -2946,6 +2946,13 @@ class StrandedCoverage:
         bw = self.fwd if strand == '+' else self.rev
         return bw.get_mean_coverage(seqid, start, end)
 
+    def antisense_mean(self, seqid: str, start: int, end: int, strand: str) -> float:
+        """Mean opposite-strand coverage. Returns None if stranded data unavailable."""
+        if not self.available:
+            return None
+        bw = self.rev if strand == '+' else self.fwd
+        return bw.get_mean_coverage(seqid, start, end)
+
     def close(self):
         if self.fwd:
             self.fwd.close()
@@ -6531,21 +6538,33 @@ class GeneAnnotationRefiner:
 
     def _passes_strand_check(self, seqid: str, start: int, end: int,
                               strand: str, unstranded_mean: float) -> bool:
-        """Veto unstranded support that looks like antisense leakage.
+        """Veto unstranded support only when stranded data shows clear
+        antisense dominance.
 
-        Returns True if stranded data is unavailable (no veto) or if the
-        same-strand mean is at least max(0.5, 0.10 * unstranded_mean).
-        Same-strand below that threshold means the unstranded signal is
-        dominated by antisense reads from a neighbor, so the support is
-        rejected.
+        Returns True (pass) if stranded data is unavailable, OR same-strand
+        coverage is substantial, OR neither strand resolves clearly (sparse
+        stranded data). Returns False (veto) only when antisense coverage
+        is positively dominant: antisense >= 1.0 absolute AND antisense >=
+        5 * sense. This avoids false vetoes in regions where stranded
+        depth is low but the data is not actually antisense.
         """
         if not self.stranded_coverage.available:
             return True
         sense = self.stranded_coverage.sense_mean(seqid, start, end, strand)
         if sense is None:
             return True
-        thresh = max(0.5, 0.10 * unstranded_mean)
-        return sense >= thresh
+        # Clear sense support — pass.
+        if sense >= max(0.5, 0.10 * unstranded_mean):
+            return True
+        # Otherwise, only veto if there's positive antisense evidence.
+        antisense = self.stranded_coverage.antisense_mean(
+            seqid, start, end, strand)
+        if antisense is None:
+            return True
+        if antisense >= 1.0 and antisense >= 5.0 * max(sense, 0.1):
+            return False
+        # Insufficient stranded data to call — pass.
+        return True
 
     @staticmethod
     def _recompute_gene_boundaries(gene: Gene):
