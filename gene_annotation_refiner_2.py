@@ -5394,6 +5394,14 @@ class GeneAnnotationRefiner:
         self._add_alternative_isoforms(consensus_genes, orf_finder)
         self.tracer.snapshot("After Step 5j (alt isoforms)", consensus_genes)
 
+        # Step 5k: Merge same-strand genes that share at least one exon
+        # exactly (alt-start / alt-end isoforms that came in as separate
+        # consensus genes -- typically from Helixer making multiple
+        # predictions over what is really one gene).
+        logger.info("\nStep 5k: Merging same-strand genes sharing exact exons...")
+        consensus_genes = self._merge_alt_start_genes(consensus_genes)
+        self.tracer.snapshot("After Step 5k (alt-start merge)", consensus_genes)
+
         # Step 6: Compute posterior probabilities
         logger.info("\nStep 6: Computing posterior probabilities...")
         # Remove genes with no valid transcripts remaining
@@ -8325,6 +8333,139 @@ class GeneAnnotationRefiner:
                     gene.seqid, ex.start, ex.end, gene.strand, cov):
                 return False
         return True
+
+    def _merge_alt_start_genes(self, genes: List[Gene]) -> List[Gene]:
+        """Merge same-strand genes that share at least one exon exactly.
+
+        Helixer (and occasionally other sources) sometimes splits a single
+        biological gene into 2-3 adjacent predictions that share most of
+        their downstream (or upstream) exons.  When two refined genes on
+        the same strand share at least one exon with identical start/end
+        coordinates, they are almost certainly alt-start/alt-end isoforms
+        of one gene.  Cluster such genes via union-find on shared exon
+        identity, pick the longest-ORF member as primary, and retain up to
+        MAX_ISOFORMS additional members as alternative transcripts.
+        """
+        MAX_ISOFORMS = 3
+
+        if len(genes) < 2:
+            return genes
+
+        # Index every transcript exon: (seqid, strand, start, end) -> set of gene idx
+        exon_idx = defaultdict(set)
+        for gi, g in enumerate(genes):
+            if g.attributes.get('manual_annotation') == 'true':
+                continue
+            for tx in g.transcripts:
+                for e in tx.exons:
+                    exon_idx[(g.seqid, g.strand, e.start, e.end)].add(gi)
+
+        # Union-find: gene index -> root
+        parent = list(range(len(genes)))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for shared in exon_idx.values():
+            if len(shared) < 2:
+                continue
+            it = iter(shared)
+            base = next(it)
+            for other in it:
+                union(base, other)
+
+        # Group by root
+        groups = defaultdict(list)
+        for gi in range(len(genes)):
+            groups[find(gi)].append(gi)
+
+        merged = []
+        consumed = set()
+        n_merged = 0
+        for root, members in groups.items():
+            if len(members) < 2:
+                continue
+            member_genes = [genes[i] for i in members
+                            if not consumed.intersection({i})]
+            if not member_genes:
+                continue
+            # All in cluster must share strand+seqid (already enforced via key)
+            # Pick primary as the one whose primary transcript has the longest ORF.
+            def orf_len(g):
+                if not g.transcripts or not g.transcripts[0].cds:
+                    return 0
+                return sum(c.end - c.start + 1 for c in g.transcripts[0].cds)
+            member_genes.sort(key=lambda g: -orf_len(g))
+            primary = member_genes[0]
+            extras = member_genes[1:]
+
+            primary_cds_min = (min(c.start for c in primary.transcripts[0].cds)
+                                if primary.transcripts and primary.transcripts[0].cds
+                                else None)
+            primary_cds_max = (max(c.end for c in primary.transcripts[0].cds)
+                                if primary.transcripts and primary.transcripts[0].cds
+                                else None)
+
+            for other in extras:
+                if len(primary.transcripts) >= MAX_ISOFORMS:
+                    break
+                # Add each of `other`'s transcripts whose CDS substantially
+                # overlaps primary's CDS span (>=50% reciprocal). Otherwise
+                # the merge would conflate separate genes.
+                added_any = False
+                for otx in other.transcripts:
+                    if not otx.exons:
+                        continue
+                    if otx.cds and primary_cds_min is not None:
+                        ocds_min = min(c.start for c in otx.cds)
+                        ocds_max = max(c.end for c in otx.cds)
+                        ov = min(ocds_max, primary_cds_max) - max(ocds_min, primary_cds_min)
+                        primary_span = primary_cds_max - primary_cds_min + 1
+                        other_span = ocds_max - ocds_min + 1
+                        if ov <= 0 or ov < 0.5 * min(primary_span, other_span):
+                            continue
+                    new_tx = Transcript(
+                        transcript_id=f"{primary.gene_id}.alt",
+                        seqid=primary.seqid, strand=primary.strand,
+                        start=otx.start, end=otx.end, source='Refined')
+                    new_tx.exons = list(otx.exons)
+                    new_tx.cds = list(otx.cds)
+                    new_tx.five_prime_utrs = list(otx.five_prime_utrs)
+                    new_tx.three_prime_utrs = list(otx.three_prime_utrs)
+                    primary.transcripts.append(new_tx)
+                    added_any = True
+                    if len(primary.transcripts) >= MAX_ISOFORMS:
+                        break
+
+                if added_any:
+                    n_merged += 1
+                    consumed.add(members[member_genes.index(other)])
+                    logger.info(
+                        f"  Step 5k: merged {other.gene_id} into "
+                        f"{primary.gene_id} as alt isoform")
+
+            self._recompute_gene_boundaries(primary)
+            merged.append(primary)
+            consumed.add(members[member_genes.index(primary)])
+
+        # Anything not in a merge group, or merge primaries already added,
+        # are returned as-is. consumed covers genes we've folded in.
+        result = [merged[i] for i in range(len(merged))]
+        for gi, g in enumerate(genes):
+            if gi in consumed:
+                continue
+            result.append(g)
+
+        if n_merged:
+            logger.info(f"  Step 5k: Merged {n_merged} gene(s) into alt-start "
+                        f"isoforms")
+        return result
 
     def _split_excessive_utr_genes(self, genes: List[Gene]) -> List[Gene]:
         """Split genes flagged by an excessive UTR-exon count using StringTie evidence.
