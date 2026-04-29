@@ -70,20 +70,31 @@ available):
     genes on the opposite strand, supply same-strand bigwigs built only
     from stranded libraries:
 
-      --bigwig_fwd FILE   bigwig of reads from + strand transcripts
-      --bigwig_rev FILE   bigwig of reads from - strand transcripts
+      --bigwig_fwd FILE   coverage of transcripts on the + strand
+      --bigwig_rev FILE   coverage of transcripts on the - strand
 
-    Both must be provided together. When supplied, Phase 4.5 (terminal-
-    exon UTR extension) and Step 5g.5 (downstream-exon recovery) reject
-    a candidate region if same-strand mean coverage is below
-    max(0.5, 0.10 * unstranded_mean) — i.e. the unstranded support is
-    actually antisense reads from a neighbor.
+    Naming convention: these flags expect bigwigs labeled by TRANSCRIPT
+    strand, not read strand. Under dUTP-protocol libraries (TruSeq
+    Stranded, NEB Ultra II Directional, etc.) reads map to the genomic
+    strand OPPOSITE the originating transcript. Pipelines that split
+    bigwigs by read strand therefore produce files where:
 
-    Build with deepTools (note: dUTP-protocol reads map as the reverse
-    complement of the original mRNA — `--filterRNAstrand forward` selects
-    reads from + strand transcripts):
-      bamCoverage -b stranded.bam --filterRNAstrand forward -o sample.fwd.bw
-      bamCoverage -b stranded.bam --filterRNAstrand reverse -o sample.rev.bw
+      *forward.bw  (reads on + genomic strand) = − strand transcripts
+                                                  -> pass to --bigwig_rev
+      *reverse.bw  (reads on − genomic strand) = + strand transcripts
+                                                  -> pass to --bigwig_fwd
+
+    deepTools handles the dUTP flip internally, so its outputs are
+    transcript-strand-labeled and pass through directly:
+      bamCoverage -b stranded.bam --filterRNAstrand forward -o plus_tx.bw
+      bamCoverage -b stranded.bam --filterRNAstrand reverse -o minus_tx.bw
+    -> --bigwig_fwd plus_tx.bw  --bigwig_rev minus_tx.bw
+
+    Both flags must be provided together. When supplied, Phase 4.5
+    (terminal-exon UTR extension) and Step 5g.5 (downstream-exon
+    recovery) veto candidate regions where stranded data shows positive
+    antisense dominance (antisense >= 1.0 AND antisense >= 5x sense).
+    Sparse stranded data is no-op'd, not vetoed.
 
     Unstranded libraries cannot be split after the fact; only stranded
     libraries should contribute to these tracks.
