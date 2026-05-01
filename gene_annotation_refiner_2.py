@@ -8007,6 +8007,7 @@ class GeneAnnotationRefiner:
         SKIP_MIN_READS = 3          # absolute floor for skip support
         TERMINAL_REACH_FRAC = 0.85  # new CDS must extend to within last 15% of transcript
 
+        MAX_PASSES = 4   # iterate to apply multiple disjoint drops per tx
         n_dropped = 0
         for gene in genes:
             if gene.attributes.get('manual_annotation') == 'true':
@@ -8014,139 +8015,197 @@ class GeneAnnotationRefiner:
             for tx in gene.transcripts:
                 if not tx.cds or len(tx.exons) < 4:
                     continue
-
-                sorted_exons = sorted(tx.exons, key=lambda e: e.start)
-                cds_min = min(c.start for c in tx.cds)
-                cds_max = max(c.end for c in tx.cds)
-
-                # Count UTR exons on each end (in transcript orientation)
-                if gene.strand == '+':
-                    n_5utr = sum(1 for e in sorted_exons if e.end < cds_min)
-                    n_3utr = sum(1 for e in sorted_exons if e.start > cds_max)
-                else:
-                    n_5utr = sum(1 for e in sorted_exons if e.start > cds_max)
-                    n_3utr = sum(1 for e in sorted_exons if e.end < cds_min)
-                if max(n_5utr, n_3utr) < UTR_EXON_TRIGGER:
-                    continue
-
-                current_orf_len = sum(c.end - c.start + 1 for c in tx.cds)
-                tx_total_len = sum(e.end - e.start + 1 for e in sorted_exons)
-
-                ev_starts = self.evidence_index.get_evidence_cds_starts(
-                    gene.seqid, gene.strand, gene.start, gene.end)
-
-                best_drop_idx = None
-                best_drop_orf_len = current_orf_len
-
-                # Try dropping each internal exon (not first or last)
-                for i in range(1, len(sorted_exons) - 1):
-                    cand = sorted_exons[i]
-                    prev_exon = sorted_exons[i - 1]
-                    next_exon = sorted_exons[i + 1]
-
-                    # Junction support assessment
-                    if not self.bam_evidence.available:
-                        # Without junction data we can still proceed using
-                        # coverage as a fallback for "weak support".
-                        cand_cov = self.coverage.get_mean_coverage(
-                            gene.seqid, cand.start, cand.end)
-                        ref_covs = sorted(
-                            self.coverage.get_mean_coverage(gene.seqid, e.start, e.end)
-                            for j, e in enumerate(sorted_exons) if j != i)
-                        if not ref_covs:
-                            continue
-                        median_cov = ref_covs[len(ref_covs) // 2]
-                        if cand_cov > 0.30 * median_cov:
-                            continue
-                        skip_supported = True  # coverage-only fallback
-                    else:
-                        incl_in = self.bam_evidence.reads_at_acceptor(
-                            gene.seqid, cand.start, tolerance=2)
-                        incl_out = self.bam_evidence.reads_at_donor(
-                            gene.seqid, cand.end, tolerance=2)
-                        max_incl = max(incl_in, incl_out)
-                        # Look for the skip junction prev.end → next.start
-                        skip_juncs = self.bam_evidence.find_junctions_starting_in(
-                            gene.seqid,
-                            prev_exon.end + 1 - 2,
-                            prev_exon.end + 1 + 2,
-                            min_reads=SKIP_MIN_READS)
-                        skip_reads = 0
-                        for js, je, jc in skip_juncs:
-                            if abs(je - (next_exon.start - 1)) <= 2:
-                                skip_reads = max(skip_reads, jc)
-                        if skip_reads < SKIP_MIN_READS:
-                            continue
-                        if skip_reads < SKIP_RATIO * max(1, max_incl):
-                            continue
-                        skip_supported = True
-
-                    # Tentatively build the exon-skipped transcript and
-                    # find the best ORF.
-                    test_exons = [e for j, e in enumerate(sorted_exons) if j != i]
-                    test_orf = orf_finder.find_best_orf(
-                        gene.seqid, test_exons, gene.strand,
-                        coverage=self.coverage,
-                        evidence_cds_starts=ev_starts)
-                    if test_orf is None:
-                        continue
-                    new_cds_list = orf_finder.orf_to_genomic_cds(
-                        gene.seqid, test_exons, gene.strand,
-                        test_orf[0], test_orf[1])
-                    if not new_cds_list:
-                        continue
-                    new_cds_len = sum(c.end - c.start + 1 for c in new_cds_list)
-
-                    # Must be substantially longer
-                    if new_cds_len < ORF_GAIN_FACTOR * current_orf_len:
-                        continue
-
-                    # New CDS must reach near the terminal exon (in
-                    # transcript direction) — otherwise we haven't fixed
-                    # the trailing-UTR problem.
-                    new_cds_min = min(c.start for c in new_cds_list)
-                    new_cds_max = max(c.end for c in new_cds_list)
-                    test_sorted = sorted(test_exons, key=lambda e: e.start)
-                    tx_start = test_sorted[0].start
-                    tx_end = test_sorted[-1].end
-                    if gene.strand == '+':
-                        reach = (new_cds_max - tx_start) / max(1, tx_end - tx_start)
-                    else:
-                        reach = (tx_end - new_cds_min) / max(1, tx_end - tx_start)
-                    if reach < TERMINAL_REACH_FRAC:
-                        continue
-
-                    if new_cds_len > best_drop_orf_len:
-                        best_drop_idx = i
-                        best_drop_orf_len = new_cds_len
-
-                if best_drop_idx is not None:
-                    dropped = sorted_exons[best_drop_idx]
-                    logger.info(
-                        f"  Step 5h.4: {gene.gene_id} dropping exon "
-                        f"{dropped.start}-{dropped.end} "
-                        f"(ORF {current_orf_len} → {best_drop_orf_len} nt)")
-                    if self.tracer.enabled and self.tracer.matches(gene):
-                        self.tracer.event(
-                            "_drop_weak_premature_stop_exons",
-                            f"DROPPED exon {dropped.start}-{dropped.end} from "
-                            f"{gene.gene_id}; ORF {current_orf_len} → "
-                            f"{best_drop_orf_len} nt")
-                    tx.exons = [e for j, e in enumerate(sorted_exons)
-                                if j != best_drop_idx]
-                    tx.cds = []
-                    tx.five_prime_utrs = []
-                    tx.three_prime_utrs = []
+                # Multiple bad exons can co-exist in one transcript; each
+                # iteration drops the single best range, then re-derives
+                # CDS so the next pass sees the updated ORF and can find
+                # additional bad exons.
+                for _pass in range(MAX_PASSES):
+                    if not tx.cds or len(tx.exons) < 4:
+                        break
+                    dropped_this_pass = self._try_one_drop_pass(
+                        gene, tx, orf_finder)
+                    if not dropped_this_pass:
+                        break
                     n_dropped += 1
+                    # Re-derive CDS for next pass.
+                    orf_finder.reassign_cds(gene, coverage=self.coverage,
+                                            evidence_index=self.evidence_index)
 
-            # Re-derive CDS+UTRs if anything was dropped from this gene.
-            if any(not tx.cds and tx.exons for tx in gene.transcripts):
-                orf_finder.reassign_cds(gene, coverage=self.coverage,
-                                         evidence_index=self.evidence_index)
-                self._recompute_gene_boundaries(gene)
+            self._recompute_gene_boundaries(gene)
 
         if n_dropped:
             logger.info(f"  Step 5h.4: Dropped {n_dropped} weak internal exon(s)")
+
+    def _try_one_drop_pass(self, gene: Gene, tx,
+                           orf_finder: 'ORFFinder') -> bool:
+        """Try one drop pass on one transcript. Returns True if a drop
+        was applied. Caller is responsible for re-deriving CDS afterward
+        and re-invoking for additional passes.
+
+        Considers contiguous ranges of 1..MAX_SKIP_SPAN internal exons.
+        Multi-exon skips catch cases where one or more orphan/phantom
+        exons sit between two well-supported anchors -- a single skip
+        junction across the whole range supports their combined removal.
+        """
+        UTR_EXON_TRIGGER = 3
+        ORF_GAIN_FACTOR = 1.3
+        SKIP_RATIO = 1.3
+        SKIP_MIN_READS = 3
+        TERMINAL_REACH_FRAC = 0.85
+        MAX_SKIP_SPAN = 3
+
+        sorted_exons = sorted(tx.exons, key=lambda e: e.start)
+        cds_min = min(c.start for c in tx.cds)
+        cds_max = max(c.end for c in tx.cds)
+
+        if gene.strand == '+':
+            n_5utr = sum(1 for e in sorted_exons if e.end < cds_min)
+            n_3utr = sum(1 for e in sorted_exons if e.start > cds_max)
+        else:
+            n_5utr = sum(1 for e in sorted_exons if e.start > cds_max)
+            n_3utr = sum(1 for e in sorted_exons if e.end < cds_min)
+        if max(n_5utr, n_3utr) < UTR_EXON_TRIGGER:
+            return False
+
+        current_orf_len = sum(c.end - c.start + 1 for c in tx.cds)
+        ev_starts = self.evidence_index.get_evidence_cds_starts(
+            gene.seqid, gene.strand, gene.start, gene.end)
+
+        # When junction evidence overwhelmingly favors skipping a range
+        # (strong skip junction, weak inclusion reads on the dropped exons)
+        # we don't require an ORF gain -- the exons are clearly orphans
+        # regardless of whether the resulting ORF is much longer (boundary
+        # mismatches elsewhere can prevent the proper long ORF from
+        # materializing).
+        STRONG_SKIP_READS = 10
+        STRONG_SKIP_RATIO = 5.0
+
+        best_drop_indices = None
+        best_drop_orf_len = current_orf_len
+        best_drop_was_orphan = False
+
+        for i in range(1, len(sorted_exons) - 1):
+            for span in range(1, MAX_SKIP_SPAN + 1):
+                j = i + span - 1
+                if j >= len(sorted_exons) - 1:
+                    break
+                cand_indices = list(range(i, j + 1))
+                cand_exons = [sorted_exons[k] for k in cand_indices]
+                prev_exon = sorted_exons[i - 1]
+                next_exon = sorted_exons[j + 1]
+
+                if not self.bam_evidence.available:
+                    ref_covs = sorted(
+                        self.coverage.get_mean_coverage(gene.seqid, e.start, e.end)
+                        for k, e in enumerate(sorted_exons)
+                        if k not in set(cand_indices))
+                    if not ref_covs:
+                        continue
+                    median_cov = ref_covs[len(ref_covs) // 2]
+                    all_weak = all(
+                        self.coverage.get_mean_coverage(
+                            gene.seqid, ce.start, ce.end) <= 0.30 * median_cov
+                        for ce in cand_exons)
+                    if not all_weak:
+                        continue
+                else:
+                    max_incl = 0
+                    for ce in cand_exons:
+                        max_incl = max(max_incl,
+                            self.bam_evidence.reads_at_acceptor(
+                                gene.seqid, ce.start, tolerance=2),
+                            self.bam_evidence.reads_at_donor(
+                                gene.seqid, ce.end, tolerance=2))
+                    skip_juncs = self.bam_evidence.find_junctions_starting_in(
+                        gene.seqid,
+                        prev_exon.end + 1 - 2,
+                        prev_exon.end + 1 + 2,
+                        min_reads=SKIP_MIN_READS)
+                    skip_reads = 0
+                    for js, je, jc in skip_juncs:
+                        if abs(je - (next_exon.start - 1)) <= 2:
+                            skip_reads = max(skip_reads, jc)
+                    if skip_reads < SKIP_MIN_READS:
+                        continue
+                    if skip_reads < SKIP_RATIO * max(1, max_incl):
+                        continue
+
+                drop_set = set(cand_indices)
+                test_exons = [e for k, e in enumerate(sorted_exons)
+                              if k not in drop_set]
+                test_orf = orf_finder.find_best_orf(
+                    gene.seqid, test_exons, gene.strand,
+                    coverage=self.coverage,
+                    evidence_cds_starts=ev_starts)
+                if test_orf is None:
+                    continue
+                new_cds_list = orf_finder.orf_to_genomic_cds(
+                    gene.seqid, test_exons, gene.strand,
+                    test_orf[0], test_orf[1])
+                if not new_cds_list:
+                    continue
+                new_cds_len = sum(c.end - c.start + 1 for c in new_cds_list)
+
+                # Strong skip evidence: drop is justified even without a
+                # 1.3x ORF gain, as long as the new ORF is at least as
+                # long as current and reaches the terminal exon.
+                is_orphan_drop = (
+                    self.bam_evidence.available
+                    and skip_reads >= STRONG_SKIP_READS
+                    and skip_reads >= STRONG_SKIP_RATIO * max(1, max_incl))
+                if is_orphan_drop:
+                    if new_cds_len < current_orf_len:
+                        continue
+                else:
+                    if new_cds_len < ORF_GAIN_FACTOR * current_orf_len:
+                        continue
+                new_cds_min = min(c.start for c in new_cds_list)
+                new_cds_max = max(c.end for c in new_cds_list)
+                test_sorted = sorted(test_exons, key=lambda e: e.start)
+                tx_start = test_sorted[0].start
+                tx_end = test_sorted[-1].end
+                if gene.strand == '+':
+                    reach = (new_cds_max - tx_start) / max(1, tx_end - tx_start)
+                else:
+                    reach = (tx_end - new_cds_min) / max(1, tx_end - tx_start)
+                if reach < TERMINAL_REACH_FRAC:
+                    continue
+
+                # Prefer orphan drops over non-orphan when both qualify
+                # (same ORF length); orphan signal is stronger evidence.
+                better = False
+                if best_drop_indices is None:
+                    better = True
+                elif is_orphan_drop and not best_drop_was_orphan:
+                    better = True
+                elif is_orphan_drop == best_drop_was_orphan:
+                    better = new_cds_len > best_drop_orf_len
+                if better:
+                    best_drop_indices = cand_indices
+                    best_drop_orf_len = new_cds_len
+                    best_drop_was_orphan = is_orphan_drop
+
+        if best_drop_indices is None:
+            return False
+
+        dropped_exons = [sorted_exons[k] for k in best_drop_indices]
+        desc = ', '.join(f"{e.start}-{e.end}" for e in dropped_exons)
+        logger.info(
+            f"  Step 5h.4: {gene.gene_id} dropping {len(dropped_exons)} "
+            f"exon(s) [{desc}] (ORF {current_orf_len} → "
+            f"{best_drop_orf_len} nt)")
+        if self.tracer.enabled and self.tracer.matches(gene):
+            self.tracer.event(
+                "_drop_weak_premature_stop_exons",
+                f"DROPPED {len(dropped_exons)} exon(s) [{desc}] "
+                f"from {gene.gene_id}; ORF {current_orf_len} → "
+                f"{best_drop_orf_len} nt")
+        drop_set = set(best_drop_indices)
+        tx.exons = [e for k, e in enumerate(sorted_exons) if k not in drop_set]
+        tx.cds = []
+        tx.five_prime_utrs = []
+        tx.three_prime_utrs = []
+        return True
 
     def _add_alternative_isoforms(self, genes: List[Gene],
                                     orf_finder: 'ORFFinder') -> None:
