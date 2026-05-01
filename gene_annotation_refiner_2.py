@@ -8434,11 +8434,18 @@ class GeneAnnotationRefiner:
         merged = []
         consumed = set()
         n_merged = 0
+        # Map gene object identity to its index in the input list so we can
+        # mark `consumed` correctly even after sorting member_genes.  Using
+        # member_genes.index() against a freshly-sorted list and then
+        # indexing back into `members` (the unsorted index list) gave the
+        # wrong global index, leaving the primary unconsumed -> duplicate
+        # output records with the same gene_id.
+        gene_to_idx = {id(g): i for i, g in enumerate(genes)}
         for root, members in groups.items():
             if len(members) < 2:
                 continue
             member_genes = [genes[i] for i in members
-                            if not consumed.intersection({i})]
+                            if i not in consumed]
             if not member_genes:
                 continue
             # All in cluster must share strand+seqid (already enforced via key)
@@ -8491,14 +8498,14 @@ class GeneAnnotationRefiner:
 
                 if added_any:
                     n_merged += 1
-                    consumed.add(members[member_genes.index(other)])
+                    consumed.add(gene_to_idx[id(other)])
                     logger.info(
                         f"  Step 5k: merged {other.gene_id} into "
                         f"{primary.gene_id} as alt isoform")
 
             self._recompute_gene_boundaries(primary)
             merged.append(primary)
-            consumed.add(members[member_genes.index(primary)])
+            consumed.add(gene_to_idx[id(primary)])
 
         # Anything not in a merge group, or merge primaries already added,
         # are returned as-is. consumed covers genes we've folded in.
