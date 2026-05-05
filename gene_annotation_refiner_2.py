@@ -70,24 +70,24 @@ available):
     genes on the opposite strand, supply same-strand bigwigs built only
     from stranded libraries:
 
-      --bigwig_fwd FILE   reads mapping to the + strand of the genome
-      --bigwig_rev FILE   reads mapping to the − strand of the genome
+      --bigwig_fwd FILE   any stranded bigwig (one of the strand-split outputs)
+      --bigwig_rev FILE   any stranded bigwig (the complementary set)
 
-    Convention: these flags follow READ-strand labeling (the typical
-    output naming of bamCoverage and most stranded splitters, e.g.
-    *.forward.bw / *.reverse.bw). The pipeline assumes a dUTP-style
-    library protocol (TruSeq Stranded, NEB Ultra II Directional, most
-    modern stranded RNA-seq), where reads map to the genomic strand
-    OPPOSITE the originating transcript. The internal sense/antisense
-    lookup applies that flip automatically:
+    Convention is auto-detected. Different pipelines and protocols
+    (PacBio Iso-Seq vs dUTP Illumina, custom split-by-read vs deepTools
+    --filterRNAstrand) produce strand-split bigwigs with opposite
+    labeling conventions, and even mix them within one experiment. The
+    pipeline samples CDS bodies of predicted genes (from the supplied
+    Helixer / TransDecoder / StringTie GFFs) and measures each bigwig's
+    signal at + vs − strand gene bodies, then assigns each file to a
+    "+ transcript" or "− transcript" bucket based on which side its
+    signal dominates. Files with no clear preference are discarded with
+    a warning.
 
-      + strand gene's sense reads  =  reads on − genome strand  =  --bigwig_rev
-      − strand gene's sense reads  =  reads on + genome strand  =  --bigwig_fwd
-
-    Just pass *.forward.bw to --bigwig_fwd and *.reverse.bw to --bigwig_rev
-    and the strand-mapping is handled correctly.
-
-    Both flags must be provided together. When supplied, Phase 4.5
+    Mix any combination of *.forward.bw / *.reverse.bw across
+    --bigwig_fwd and --bigwig_rev (the flag distinction is just a
+    naming convenience). Detection is logged at startup. Both flags
+    must be provided together. When supplied, Phase 4.5
     (terminal-exon UTR extension) and Step 5g.5 (downstream-exon
     recovery) veto candidate regions where stranded data shows positive
     antisense dominance (antisense >= 1.0 AND antisense >= 5x sense).
@@ -2954,43 +2954,162 @@ class CoverageAccess:
 class StrandedCoverage:
     """Optional stranded coverage tracks for antisense vetoes.
 
-    Bigwigs are expected to follow the convention used by deepTools
-    bamCoverage and most stranded splitters (read-strand-labeled, dUTP
-    library protocol):
+    Bigwigs can come from any pipeline / protocol -- different tools and
+    different protocols (Iso-Seq vs dUTP Illumina) produce strand-split
+    bigwigs with opposite labeling conventions. To handle that
+    transparently, each file is assigned to a "+ transcript" or
+    "− transcript" group EMPIRICALLY by sampling coverage at predicted
+    gene CDS bodies after GFFs are loaded.
 
-      --bigwig_fwd FILE   reads mapping to the + strand of the genome
-      --bigwig_rev FILE   reads mapping to the − strand of the genome
-
-    Under the dUTP protocol (TruSeq Stranded, NEB Ultra II Directional,
-    most modern stranded RNA-seq libraries), reads map as the reverse
-    complement of the original mRNA. So:
-
-      reads on + genome strand  =  − strand transcripts  →  bigwig_fwd
-      reads on − genome strand  =  + strand transcripts  →  bigwig_rev
-
-    The internal sense/antisense lookup applies that flip automatically:
-    a + strand gene's "sense" coverage comes from bigwig_rev, and so on.
+    The CLI flags --bigwig_fwd / --bigwig_rev are accepted as a naming
+    convenience but their assignment to internal +/− buckets is
+    determined by content, not by flag.
     """
 
-    def __init__(self, fwd_path: str = None, rev_path: str = None):
-        self.fwd = CoverageAccess(fwd_path) if fwd_path else None
-        self.rev = CoverageAccess(rev_path) if rev_path else None
-        self.available = self.fwd is not None and self.rev is not None
+    def __init__(self, fwd_path=None, rev_path=None):
+        # Collect all paths regardless of which CLI flag they came in on;
+        # buckets are assigned by detect_orientations() after GFFs load.
+        def _collect(p):
+            if not p:
+                return []
+            return [p] if isinstance(p, str) else list(p)
+        self._all_paths = _collect(fwd_path) + _collect(rev_path)
+        self.plus_tx = None    # CoverageAccess wrapping bigwigs of + transcripts
+        self.minus_tx = None   # CoverageAccess wrapping bigwigs of - transcripts
+        self.available = bool(self._all_paths)
+        self._detected = False
+        # Pre-emptive cache: open each file once for sampling, then close
+        # and reopen as a CoverageAccess group after detection.
+
+    def detect_orientations(self, helixer_genes=None, td_genes=None,
+                              st_genes=None, n_sample=200, min_cds_len=300):
+        """Determine each bigwig's strand content empirically.
+
+        Samples up to ``n_sample`` predicted-gene CDS bodies (half +
+        strand, half − strand, each ≥ min_cds_len bp, multi-exon
+        preferred) from the supplied input gene sets. For each bigwig,
+        compares mean signal at + and − strand bodies; the strand with
+        the higher mean is the bucket assigned to the file. Files where
+        both means are tiny or roughly equal are flagged ambiguous and
+        skipped.
+        """
+        import pyBigWig
+        if not self._all_paths:
+            return
+        all_genes = (helixer_genes or []) + (td_genes or []) + (st_genes or [])
+        plus_regions, minus_regions = [], []
+        seen_keys = set()
+        for g in all_genes:
+            if g.strand not in ('+', '-'):
+                continue
+            for tx in g.transcripts:
+                if not tx.cds:
+                    continue
+                cds_lo = min(c.start for c in tx.cds)
+                cds_hi = max(c.end for c in tx.cds)
+                if cds_hi - cds_lo + 1 < min_cds_len:
+                    continue
+                key = (g.seqid, cds_lo, cds_hi)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if g.strand == '+':
+                    plus_regions.append((g.seqid, cds_lo, cds_hi))
+                else:
+                    minus_regions.append((g.seqid, cds_lo, cds_hi))
+        # Cap each side to n_sample/2
+        half = max(20, n_sample // 2)
+        plus_regions = plus_regions[:half]
+        minus_regions = minus_regions[:half]
+        if len(plus_regions) < 3 or len(minus_regions) < 3:
+            logger.warning("StrandedCoverage: too few sample CDS bodies "
+                           f"(+={len(plus_regions)}, -={len(minus_regions)}) "
+                           "to auto-detect bigwig strand convention; treating "
+                           "all bigwigs as same-strand neutral.")
+            self.available = False
+            return
+
+        plus_paths, minus_paths = [], []
+        ambig_paths = []
+        logger.info(f"StrandedCoverage: detecting strand convention for "
+                    f"{len(self._all_paths)} bigwig file(s) using "
+                    f"{len(plus_regions)} + and {len(minus_regions)} − strand "
+                    f"sample CDS bodies...")
+        for path in self._all_paths:
+            try:
+                bw = pyBigWig.open(path)
+            except Exception as e:
+                logger.warning(f"  cannot open {path}: {e} — skipping")
+                continue
+            chroms = bw.chroms()
+
+            def mean_signal(regions):
+                vals = []
+                for seqid, s, e in regions:
+                    if seqid not in chroms:
+                        continue
+                    e = min(e, chroms[seqid])
+                    if e <= s:
+                        continue
+                    try:
+                        v = bw.values(seqid, s - 1, e)
+                        v = [x for x in v if x is not None and not np.isnan(x)]
+                        if v:
+                            vals.append(sum(v) / len(v))
+                    except Exception:
+                        continue
+                return float(np.mean(vals)) if vals else 0.0
+
+            p_signal = mean_signal(plus_regions)
+            m_signal = mean_signal(minus_regions)
+            bw.close()
+
+            base = os.path.basename(path)
+            if max(p_signal, m_signal) < 0.5:
+                ambig_paths.append(path)
+                logger.warning(f"  {base}: too little signal "
+                               f"(+={p_signal:.2f}, −={m_signal:.2f}) — discarded")
+                continue
+            ratio = max(p_signal, m_signal) / max(0.01, min(p_signal, m_signal))
+            if ratio < 2.0:
+                ambig_paths.append(path)
+                logger.warning(f"  {base}: ambiguous strand "
+                               f"(+={p_signal:.2f}, −={m_signal:.2f}, "
+                               f"ratio={ratio:.2f}) — discarded")
+                continue
+            if p_signal > m_signal:
+                plus_paths.append(path)
+                logger.info(f"  {base}: + transcript content "
+                            f"(+={p_signal:.1f}, −={m_signal:.1f})")
+            else:
+                minus_paths.append(path)
+                logger.info(f"  {base}: − transcript content "
+                            f"(+={p_signal:.1f}, −={m_signal:.1f})")
+
+        self.plus_tx = CoverageAccess(plus_paths) if plus_paths else None
+        self.minus_tx = CoverageAccess(minus_paths) if minus_paths else None
+        self.available = bool(self.plus_tx and self.minus_tx)
+        self._detected = True
+        if not self.available:
+            logger.warning("StrandedCoverage: detection produced no usable "
+                           "+/− pair; antisense check will be inactive.")
+        else:
+            logger.info(f"StrandedCoverage: ready with "
+                        f"{len(plus_paths)} + transcript file(s), "
+                        f"{len(minus_paths)} − transcript file(s)")
 
     def sense_mean(self, seqid: str, start: int, end: int, strand: str) -> float:
-        """Mean same-strand coverage (in transcript orientation).
-        Under dUTP, + strand transcripts come from reads on the − genome
-        strand, so query bigwig_rev for + strand genes."""
+        """Mean same-strand coverage (in transcript orientation)."""
         if not self.available:
             return None
-        bw = self.rev if strand == '+' else self.fwd
+        bw = self.plus_tx if strand == '+' else self.minus_tx
         return bw.get_mean_coverage(seqid, start, end)
 
     def antisense_mean(self, seqid: str, start: int, end: int, strand: str) -> float:
         """Mean opposite-strand coverage (in transcript orientation)."""
         if not self.available:
             return None
-        bw = self.fwd if strand == '+' else self.rev
+        bw = self.minus_tx if strand == '+' else self.plus_tx
         return bw.get_mean_coverage(seqid, start, end)
 
     def close(self):
@@ -4794,10 +4913,10 @@ class GeneAnnotationRefiner:
         self.genome = GenomeAccess(genome_path)
         self.coverage = CoverageAccess(bigwig_path) if bigwig_path else NoCoverageAccess()
         self.stranded_coverage = StrandedCoverage(bigwig_fwd_path, bigwig_rev_path)
-        if self.stranded_coverage.available:
-            logger.info("Stranded coverage available — will be used to veto "
-                        "antisense-driven UTR extension and downstream-exon "
-                        "recovery.")
+        if self.stranded_coverage._all_paths:
+            logger.info(f"Stranded coverage: {len(self.stranded_coverage._all_paths)} "
+                        f"file(s) supplied; strand convention will be auto-"
+                        f"detected after GFFs are loaded.")
         self.cfg = scoring_config or ScoringConfig()
         self.pwm_organism = pwm_organism
         self.tracer = tracer or GeneTracer()
@@ -4913,6 +5032,18 @@ class GeneAnnotationRefiner:
         if self.st_genes:
             self.evidence_index.add_genes(self.st_genes, 'StringTie')
         self.evidence_index.build()
+
+        # Auto-detect strand convention of each stranded bigwig file
+        # using sample CDS bodies from the parsed input genes. Different
+        # protocols (Iso-Seq vs dUTP Illumina) and different splitter
+        # tools produce strand-split bigwigs with opposite labeling
+        # conventions; empirical detection avoids requiring the user to
+        # know how each was generated.
+        if self.stranded_coverage._all_paths:
+            self.stranded_coverage.detect_orientations(
+                helixer_genes=self.helixer_genes,
+                td_genes=self.td_genes,
+                st_genes=self.st_genes)
 
         # Initialize analysis modules
         self.posterior_calc = PosteriorCalculator(self.genome, self.coverage,
