@@ -5165,18 +5165,41 @@ class GeneAnnotationRefiner:
                 tx.exons = enforce_canonical_splice_sites(
                     self.genome, gene.seqid, tx.exons, gene.strand,
                     bam_evidence=self.bam_evidence)
-                # Remove exons that still create non-canonical splice sites
-                tx.exons = self._remove_noncanonical_exons(
-                    gene.seqid, tx.exons, gene.strand)
+                # If any non-canonical splice remains, prefer trimming the
+                # transcript ends to the canonical-splice core that contains
+                # the CDS. This preserves CDS-flanking canonical exons even
+                # when bad splice sites in UTR exons would otherwise cause
+                # _remove_noncanonical_exons to cascade-delete most of the
+                # transcript.
+                if tx.exons and not self._all_splices_canonical(
+                        gene.seqid, tx.exons, gene.strand):
+                    trimmed = self._trim_to_canonical_core(
+                        gene.seqid, gene.strand, tx)
+                    if trimmed is None or not self._all_splices_canonical(
+                            gene.seqid, trimmed.exons, gene.strand):
+                        # Trim couldn't find a CDS-containing canonical
+                        # core; fall back to the per-exon removal pass.
+                        tx.exons = self._remove_noncanonical_exons(
+                            gene.seqid, tx.exons, gene.strand)
                 # Filter CDS for minimum size
                 tx.cds = [c for c in tx.cds if c.length >= MIN_EXON_SIZE]
             # Re-deduplicate after modifications
             gene.transcripts = deduplicate_isoforms(gene.transcripts)
-            # Remove transcripts with non-canonical splice sites
-            gene.transcripts = [
-                tx for tx in gene.transcripts
-                if self._all_splices_canonical(gene.seqid, tx.exons, gene.strand)
-            ]
+            # Trim non-canonical-splice exons from each end of the
+            # transcript instead of discarding the whole thing. Bad
+            # splices are usually in UTR exons (mixed TD pool boundaries
+            # or low-confidence ends); preserving the CDS-containing
+            # canonical core matters more than dropping the gene.
+            kept = []
+            for tx in gene.transcripts:
+                if self._all_splices_canonical(gene.seqid, tx.exons, gene.strand):
+                    kept.append(tx)
+                    continue
+                trimmed = self._trim_to_canonical_core(
+                    gene.seqid, gene.strand, tx)
+                if trimmed is not None:
+                    kept.append(trimmed)
+            gene.transcripts = kept
         self.tracer.snapshot("After Step 2 (canonical splice enforce)", consensus_genes)
 
         # Step 3: Evaluate splice sites and UTR boundaries
@@ -5599,6 +5622,90 @@ class GeneAnnotationRefiner:
                     (donor == 'GC' and acceptor == 'AG')):
                 return False
         return True
+
+    def _trim_to_canonical_core(self, seqid: str, strand: str, tx):
+        """Trim non-canonical-splice exons from each transcript end and
+        return the longest contiguous canonical-splice run that contains
+        the CDS. Returns None if nothing usable remains.
+
+        Bad splice sites are usually in UTR exons (mixed pool boundaries
+        from different evidence isoforms or low-confidence ends). The
+        CDS-flanking core almost always has clean GT-AG splices.
+        """
+        if not tx.exons:
+            return None
+        sorted_exons = sorted(tx.exons, key=lambda e: e.start)
+        n = len(sorted_exons)
+        if n < 2:
+            # No introns to test
+            tx.exons = sorted_exons
+            return tx
+
+        # Mark each intron canonical / not.
+        canonical = []
+        for i in range(n - 1):
+            intron_s = sorted_exons[i].end + 1
+            intron_e = sorted_exons[i + 1].start - 1
+            if intron_e - intron_s + 1 < MIN_INTRON_SIZE:
+                canonical.append(True)
+                continue
+            if strand == '+':
+                d = self.genome.get_sequence(seqid, intron_s, intron_s + 1).upper()
+                a = self.genome.get_sequence(seqid, intron_e - 1, intron_e).upper()
+            else:
+                d = reverse_complement(
+                    self.genome.get_sequence(seqid, intron_e - 1, intron_e)).upper()
+                a = reverse_complement(
+                    self.genome.get_sequence(seqid, intron_s, intron_s + 1)).upper()
+            if len(d) < 2 or len(a) < 2:
+                canonical.append(True)
+                continue
+            canonical.append((d in ('GT', 'GC')) and a == 'AG')
+
+        # Find the longest contiguous canonical-splice run as a [lo, hi]
+        # exon-index range (inclusive). An exon range [lo, hi] is valid
+        # if all introns canonical[lo..hi-1] are True.
+        best_lo, best_hi = 0, 0
+        cur_lo = 0
+        for i in range(n):
+            if i == 0:
+                cur_lo = 0
+            elif not canonical[i - 1]:
+                cur_lo = i
+            if i - cur_lo > best_hi - best_lo:
+                best_lo, best_hi = cur_lo, i
+
+        # If no improvement, no canonical run found.
+        if best_lo == best_hi == 0 and not canonical:
+            return None
+
+        # Require the canonical core to contain the CDS span (or at least
+        # overlap the CDS). Otherwise we'd ship a UTR-only fragment.
+        if tx.cds:
+            cds_lo = min(c.start for c in tx.cds)
+            cds_hi = max(c.end for c in tx.cds)
+            core_lo = sorted_exons[best_lo].start
+            core_hi = sorted_exons[best_hi].end
+            if core_hi < cds_lo or core_lo > cds_hi:
+                return None
+
+        kept = sorted_exons[best_lo:best_hi + 1]
+        if len(kept) == n:
+            tx.exons = kept
+            return tx
+
+        # Trim CDS / UTRs to within the kept exon span.
+        keep_lo = kept[0].start
+        keep_hi = kept[-1].end
+        tx.exons = kept
+        tx.cds = [c for c in tx.cds if c.start >= keep_lo and c.end <= keep_hi]
+        tx.five_prime_utrs = [u for u in tx.five_prime_utrs
+                               if u.start >= keep_lo and u.end <= keep_hi]
+        tx.three_prime_utrs = [u for u in tx.three_prime_utrs
+                                if u.start >= keep_lo and u.end <= keep_hi]
+        tx.start = keep_lo
+        tx.end = keep_hi
+        return tx
 
     def _filter_unsupported_exons(self, seqid: str, exons: List[Feature],
                                     strand: str) -> List[Feature]:
