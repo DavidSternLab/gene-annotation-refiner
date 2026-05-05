@@ -6691,6 +6691,26 @@ class GeneAnnotationRefiner:
         if n_recovered:
             logger.info(f"  Recovered downstream exons for {n_recovered} gene(s)")
 
+    def _stranded_supports_extension(self, seqid: str, start: int, end: int,
+                                       strand: str) -> bool:
+        """True when stranded data clearly favors same-strand transcription
+        in the candidate region. Used to relax the unstranded relative-
+        coverage gate during UTR extension, since the relative gate exists
+        to suppress unrelated signal that stranded data already disambiguates.
+
+        Requires sense >= 1.0 absolute AND sense >= 5x antisense (uses a
+        floor of 0.1 on antisense to avoid divide-by-zero artifacts at
+        regions with sparse stranded coverage).
+        """
+        sc = getattr(self, 'stranded_coverage', None)
+        if sc is None or not getattr(sc, 'available', False):
+            return False
+        sense = sc.sense_mean(seqid, start, end, strand)
+        antisense = sc.antisense_mean(seqid, start, end, strand)
+        if sense is None or antisense is None:
+            return False
+        return sense >= 1.0 and sense >= 5.0 * max(antisense, 0.1)
+
     def _passes_strand_check(self, seqid: str, start: int, end: int,
                               strand: str, unstranded_mean: float) -> bool:
         """Veto unstranded support only when stranded data shows clear
@@ -7707,7 +7727,17 @@ class GeneAnnotationRefiner:
                         gene.seqid, ext_start, ext_end)
                     if ext_cov < UTR_COV_ABS_MIN:
                         continue
-                    if exon_cov_first > 0 and ext_cov < UTR_COV_REL_MIN * exon_cov_first:
+                    # Stranded-data bypass: if same-strand reads clearly
+                    # dominate antisense in the extension region, skip the
+                    # relative-to-exon-body threshold. The relative gate is
+                    # there to suppress spurious unstranded signal; stranded
+                    # confirmation makes that suppression unnecessary, and
+                    # the gate would otherwise wrongly reject low-but-real
+                    # 3' UTR signal that is genuinely from this strand.
+                    strand_confirms = self._stranded_supports_extension(
+                        gene.seqid, ext_start, ext_end, gene.strand)
+                    if (not strand_confirms and exon_cov_first > 0
+                            and ext_cov < UTR_COV_REL_MIN * exon_cov_first):
                         continue
                     if any(os_ <= ext_end and oe_ >= ext_start
                            for (_g, os_, oe_) in others):
@@ -7756,7 +7786,10 @@ class GeneAnnotationRefiner:
                         gene.seqid, ext_start, ext_end)
                     if ext_cov < UTR_COV_ABS_MIN:
                         continue
-                    if exon_cov_last > 0 and ext_cov < UTR_COV_REL_MIN * exon_cov_last:
+                    strand_confirms = self._stranded_supports_extension(
+                        gene.seqid, ext_start, ext_end, gene.strand)
+                    if (not strand_confirms and exon_cov_last > 0
+                            and ext_cov < UTR_COV_REL_MIN * exon_cov_last):
                         continue
                     if any(os_ <= ext_end and oe_ >= ext_start
                            for (_g, os_, oe_) in others):
