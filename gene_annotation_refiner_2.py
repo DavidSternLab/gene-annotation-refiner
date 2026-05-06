@@ -8961,25 +8961,68 @@ class GeneAnnotationRefiner:
 
                     # Build fused exon set: union-merge overlapping exons
                     # so the spliced transcript sequence is well-defined.
-                    # Two genes that share a region with slightly different
-                    # boundaries would otherwise contribute overlapping
-                    # exons that ORFFinder sees as separate -- duplicating
-                    # sequence and breaking the reading frame.
+                    # Then, for any merged interval that was created by
+                    # combining two non-identical contributing exons (one
+                    # gene's exon was over-extended into the other gene's
+                    # CDS region), look for a canonical splice junction
+                    # fully inside the merged interval and split there.
+                    # That converts an over-extended UTR into a proper
+                    # intron + correctly-bounded next exon, restoring the
+                    # reading frame.
                     raw = sorted(
                         [(e.start, e.end) for e in tx.exons]
                         + [(e.start, e.end) for e in tx2.exons])
+                    # Track which merged intervals received contributions
+                    # from BOTH genes -- those are the "merge points" that
+                    # may include over-extended UTR and need junction
+                    # refinement. Exons that came from only one gene are
+                    # left alone.
+                    a_set = set((e.start, e.end) for e in tx.exons)
+                    b_set = set((e.start, e.end) for e in tx2.exons)
                     merged_intervals = []
+                    interval_sources = []  # set('a','b') per merged interval
                     for s, e in raw:
+                        src = ('a' if (s, e) in a_set else '') + (
+                            'b' if (s, e) in b_set else '')
                         if merged_intervals and s <= merged_intervals[-1][1] + 1:
                             merged_intervals[-1] = (
                                 merged_intervals[-1][0],
                                 max(merged_intervals[-1][1], e))
+                            interval_sources[-1] = interval_sources[-1] | set(src)
                         else:
                             merged_intervals.append((s, e))
+                            interval_sources.append(set(src))
+
+                    # Junction-split intervals contributed by both genes
+                    # (potential merge points where UTR extension blurred
+                    # the splice site).
+                    def _split_at_junctions(s, e):
+                        if not self.bam_evidence.available or e - s < 4:
+                            return [(s, e)]
+                        juncs = self.bam_evidence.find_junctions_starting_in(
+                            seqid, s + 1, e - 1, min_reads=2)
+                        in_exon = [(js, je, jc) for js, je, jc in juncs
+                                   if js > s and je < e]
+                        if not in_exon:
+                            return [(s, e)]
+                        js, je, jc = max(in_exon, key=lambda x: x[2])
+                        result = []
+                        if js - 1 >= s:
+                            result.extend(_split_at_junctions(s, js - 1))
+                        if je + 1 <= e:
+                            result.extend(_split_at_junctions(je + 1, e))
+                        return result if result else [(s, e)]
+
+                    refined = []
+                    for (s, e), srcs in zip(merged_intervals, interval_sources):
+                        if 'a' in srcs and 'b' in srcs:
+                            refined.extend(_split_at_junctions(s, e))
+                        else:
+                            refined.append((s, e))
                     fused_exons = [Feature(
                         seqid=seqid, source='Refined', ftype='exon',
                         start=s, end=e, score=0.0, strand=strand,
-                        phase='.', attributes={}) for s, e in merged_intervals]
+                        phase='.', attributes={}) for s, e in refined]
 
                     # Run ORFFinder on fused exon set
                     fuse_lo = min(g.start, g2.start)
