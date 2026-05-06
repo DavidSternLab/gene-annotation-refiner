@@ -9354,10 +9354,27 @@ def write_refined_gff(genes: List[Gene], output_path: str):
                     f.write(f"{gene.seqid}\tRefined\tfive_prime_UTR\t{utr.start}\t{utr.end}\t"
                            f".\t{gene.strand}\t.\t{utr_attrs}\n")
 
-                # CDS features
-                for i, cds in enumerate(sorted(tx.cds, key=lambda c: c.start), 1):
+                # CDS features. Compute phase from cumulative CDS length
+                # in transcript direction (5' to 3'). GFF3 phase is the
+                # number of bases to skip at the start of the segment to
+                # reach the next codon boundary. For the first segment
+                # phase = 0; subsequent: (3 - cumulative_len % 3) % 3.
+                # Downstream tools (gffread, CDS phase-aware GFF readers,
+                # R rtracklayer numeric phase comparisons) require
+                # numeric 0/1/2 here -- writing "." silently breaks them.
+                sorted_cds = sorted(tx.cds, key=lambda c: c.start)
+                if gene.strand == '-':
+                    iter_order = list(reversed(sorted_cds))  # 5' first on - strand
+                else:
+                    iter_order = list(sorted_cds)
+                phase_map = {}
+                cum = 0
+                for c in iter_order:
+                    phase_map[id(c)] = (3 - (cum % 3)) % 3
+                    cum += c.end - c.start + 1
+                for i, cds in enumerate(sorted_cds, 1):
                     cds_attrs = f"ID={tx.transcript_id}.CDS.{i};Parent={tx.transcript_id}"
-                    phase = cds.phase if cds.phase in ('0', '1', '2') else '.'
+                    phase = phase_map.get(id(cds), 0)
                     f.write(f"{gene.seqid}\tRefined\tCDS\t{cds.start}\t{cds.end}\t"
                            f"{cds.score:.4f}\t{gene.strand}\t{phase}\t{cds_attrs}\n")
 
