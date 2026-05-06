@@ -5596,6 +5596,16 @@ class GeneAnnotationRefiner:
         consensus_genes = self._merge_alt_start_genes(consensus_genes)
         self.tracer.snapshot("After Step 5k (alt-start merge)", consensus_genes)
 
+        # Step 5l: Fuse same-strand neighbors when one gene's UTR-exon
+        # pile-up overlaps the other's CDS. Catches genes that were split
+        # at a small boundary mismatch -- standard merge skips overlapping
+        # candidates and Step 5k requires exon equality, so this is the
+        # remaining gap.
+        logger.info("\nStep 5l: Fusing UTR-overlap same-strand genes...")
+        consensus_genes = self._fuse_utr_overlapping_genes(
+            consensus_genes, orf_finder)
+        self.tracer.snapshot("After Step 5l (UTR-overlap fuse)", consensus_genes)
+
         # Step 6: Compute posterior probabilities
         logger.info("\nStep 6: Computing posterior probabilities...")
         # Remove genes with no valid transcripts remaining
@@ -8849,6 +8859,193 @@ class GeneAnnotationRefiner:
             logger.info(f"  Step 5k: Merged {n_merged} gene(s) into alt-start "
                         f"isoforms")
         return result
+
+    def _fuse_utr_overlapping_genes(self, genes: List[Gene],
+                                      orf_finder: 'ORFFinder') -> List[Gene]:
+        """Fuse same-strand neighbors that look like one gene split
+        into two by a small boundary mismatch.
+
+        Triggers (either sufficient):
+          (a) gene has >=2 UTR exons on either end AND a same-strand
+              neighbor's footprint overlaps that gene's UTR end, OR
+          (b) gene has any exon that overlaps an exon of a same-strand
+              neighbor (direct evidence of a shared exon split into
+              two slightly-different boundary versions).
+
+        Then build a fused exon set, re-derive the best ORF, and
+        commit only when the new ORF:
+          - reaches a stop codon
+          - has length >= 0.85 * (orf_a + orf_b)
+          - overlaps both original CDS spans (so it's not just a
+            random local ORF that happens to lie on the fused exons).
+        Spuriously-adjacent but biologically distinct genes won't
+        satisfy the ORF gate.
+        """
+        UTR_TRIGGER = 2
+        ORF_KEEP_FRAC = 0.85
+
+        if len(genes) < 2:
+            return genes
+
+        # Index by (seqid, strand) for neighbor lookup
+        by_region = defaultdict(list)
+        for gi, g in enumerate(genes):
+            if g.attributes.get('manual_annotation') == 'true':
+                continue
+            if not g.transcripts or not g.transcripts[0].cds:
+                continue
+            by_region[(g.seqid, g.strand)].append(gi)
+        for key in by_region:
+            by_region[key].sort(key=lambda i: genes[i].start)
+
+        consumed = set()
+        n_fused = 0
+
+        # Helper: count UTR exons per end for a transcript
+        def _utr_counts(tx, strand):
+            sorted_e = sorted(tx.exons, key=lambda e: e.start)
+            cmin = min(c.start for c in tx.cds)
+            cmax = max(c.end for c in tx.cds)
+            if strand == '+':
+                n5 = sum(1 for e in sorted_e if e.end < cmin)
+                n3 = sum(1 for e in sorted_e if e.start > cmax)
+            else:
+                n5 = sum(1 for e in sorted_e if e.start > cmax)
+                n3 = sum(1 for e in sorted_e if e.end < cmin)
+            return n5, n3
+
+        for (seqid, strand), gidxs in by_region.items():
+            for pos, gi in enumerate(gidxs):
+                if gi in consumed:
+                    continue
+                g = genes[gi]
+                tx = g.transcripts[0]
+                if not tx.cds:
+                    continue
+                n5, n3 = _utr_counts(tx, strand)
+                cmin = min(c.start for c in tx.cds)
+                cmax = max(c.end for c in tx.cds)
+                trigger_a = max(n5, n3) >= UTR_TRIGGER
+                # Examine neighbors on same strand whose footprint
+                # overlaps this gene's UTR end. Try both directions.
+                for nb_pos in (pos - 1, pos + 1):
+                    if nb_pos < 0 or nb_pos >= len(gidxs):
+                        continue
+                    nj = gidxs[nb_pos]
+                    if nj in consumed:
+                        continue
+                    g2 = genes[nj]
+                    tx2 = g2.transcripts[0]
+                    if not tx2.cds:
+                        continue
+                    # Only fuse if the genes' footprints overlap
+                    if g.end < g2.start or g2.end < g.start:
+                        continue
+                    cmin2 = min(c.start for c in tx2.cds)
+                    cmax2 = max(c.end for c in tx2.cds)
+                    # Require the two CDS spans to NOT overlap (else this
+                    # is alt-isoform territory handled by Step 5k/5j) but
+                    # ONE gene's UTR exons to overlap the other's CDS
+                    if not (cmax < cmin2 or cmax2 < cmin):
+                        continue
+
+                    # Trigger (b): direct exon-level overlap between
+                    # same-strand neighbors. Strong evidence of a
+                    # shared exon split into two slightly-different
+                    # boundary versions.
+                    trigger_b = any(
+                        e1.start <= e2.end and e2.start <= e1.end
+                        for e1 in tx.exons for e2 in tx2.exons)
+                    if not (trigger_a or trigger_b):
+                        continue
+
+                    # Build fused exon set: union-merge overlapping exons
+                    # so the spliced transcript sequence is well-defined.
+                    # Two genes that share a region with slightly different
+                    # boundaries would otherwise contribute overlapping
+                    # exons that ORFFinder sees as separate -- duplicating
+                    # sequence and breaking the reading frame.
+                    raw = sorted(
+                        [(e.start, e.end) for e in tx.exons]
+                        + [(e.start, e.end) for e in tx2.exons])
+                    merged_intervals = []
+                    for s, e in raw:
+                        if merged_intervals and s <= merged_intervals[-1][1] + 1:
+                            merged_intervals[-1] = (
+                                merged_intervals[-1][0],
+                                max(merged_intervals[-1][1], e))
+                        else:
+                            merged_intervals.append((s, e))
+                    fused_exons = [Feature(
+                        seqid=seqid, source='Refined', ftype='exon',
+                        start=s, end=e, score=0.0, strand=strand,
+                        phase='.', attributes={}) for s, e in merged_intervals]
+
+                    # Run ORFFinder on fused exon set
+                    fuse_lo = min(g.start, g2.start)
+                    fuse_hi = max(g.end, g2.end)
+                    ev_starts = self.evidence_index.get_evidence_cds_starts(
+                        seqid, strand, fuse_lo, fuse_hi)
+                    orf = orf_finder.find_best_orf(
+                        seqid, fused_exons, strand,
+                        coverage=self.coverage,
+                        evidence_cds_starts=ev_starts)
+                    if orf is None:
+                        continue
+                    new_cds = orf_finder.orf_to_genomic_cds(
+                        seqid, fused_exons, strand, orf[0], orf[1])
+                    if not new_cds:
+                        continue
+                    if not has_stop_codon(self.genome, seqid, new_cds, strand):
+                        continue
+                    new_len = sum(c.end - c.start + 1 for c in new_cds)
+                    orf_a = sum(c.end - c.start + 1 for c in tx.cds)
+                    orf_b = sum(c.end - c.start + 1 for c in tx2.cds)
+                    if new_len < ORF_KEEP_FRAC * (orf_a + orf_b):
+                        continue
+                    new_min = min(c.start for c in new_cds)
+                    new_max = max(c.end for c in new_cds)
+                    overlaps_a = (new_min <= cmax and new_max >= cmin)
+                    overlaps_b = (new_min <= cmax2 and new_max >= cmin2)
+                    if not (overlaps_a and overlaps_b):
+                        continue
+
+                    # Commit the fusion: replace the longer-ORF gene with
+                    # the fused gene; consume the other.
+                    primary_gi, secondary_gi = (gi, nj) if orf_a >= orf_b else (nj, gi)
+                    primary = genes[primary_gi]
+                    primary_tx = primary.transcripts[0]
+                    primary_tx.exons = fused_exons
+                    primary_tx.cds = new_cds
+                    primary_tx.five_prime_utrs = []
+                    primary_tx.three_prime_utrs = []
+                    orf_finder._derive_utrs(primary_tx, strand)
+                    primary_tx.start = min(e.start for e in fused_exons)
+                    primary_tx.end = max(e.end for e in fused_exons)
+                    primary.start = primary_tx.start
+                    primary.end = primary_tx.end
+                    # Secondary gene's posterior is also informative; merge
+                    # evidence sources.
+                    src_a = primary.attributes.get('evidence_sources', '')
+                    src_b = genes[secondary_gi].attributes.get('evidence_sources', '')
+                    if src_b:
+                        merged = sorted(set(
+                            (src_a + ',' + src_b).split(',')))
+                        primary.attributes['evidence_sources'] = ','.join(
+                            s for s in merged if s)
+                    primary.attributes['fused_with'] = (
+                        genes[secondary_gi].gene_id)
+                    consumed.add(secondary_gi)
+                    n_fused += 1
+                    logger.info(
+                        f"  Step 5l: fused {primary.gene_id} + "
+                        f"{genes[secondary_gi].gene_id} (new ORF "
+                        f"{new_len} nt vs {orf_a}+{orf_b}={orf_a+orf_b})")
+                    break  # only fuse one neighbor per pass
+
+        if n_fused:
+            logger.info(f"  Step 5l: Fused {n_fused} gene pair(s)")
+        return [g for i, g in enumerate(genes) if i not in consumed]
 
     def _split_excessive_utr_genes(self, genes: List[Gene]) -> List[Gene]:
         """Split genes flagged by an excessive UTR-exon count using StringTie evidence.
