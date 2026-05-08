@@ -5931,43 +5931,59 @@ class GeneAnnotationRefiner:
 
     def _filter_spurious_microexons(self, seqid: str, exons: List[Feature],
                                        strand: str) -> List[Feature]:
-        """Drop internal exons shorter than MICROEXON_MAX (15 bp) that
-        lack strong junction support on both flanks.
+        """Drop internal exons shorter than MICROEXON_MAX (15 bp) only
+        when there's no junction-read OR coverage support.
 
-        Real microexons exist (some as short as 3 bp) but they always
-        have substantial canonical-junction support on both the
-        acceptor and donor side; that signature is what makes them
-        confidently callable. Predicted microexons without it are
-        typically alignment artifacts that act as spurious "bridges"
-        between two real genes and prevent the split-gene logic from
-        firing.
+        A microexon is kept if EITHER:
+          - it has at least one junction read on either flank, OR
+          - the exon body has non-trivial RNA-seq coverage (>= 2.0).
 
-        Terminal (first/last) exons are exempt -- they're not internal
-        microexons in the splicing sense.
+        Real microexons (some as small as 3 bp, including a few with
+        non-canonical splice sites) usually have at least one of these
+        signals. Spurious "bridge" microexons from alignment artifacts
+        -- the kind that fuse two real genes into one -- typically have
+        zero junction reads anywhere near them AND essentially zero
+        coverage. Terminal exons are exempt.
         """
         MICROEXON_MAX = 15
-        MIN_FLANK_READS = 3
+        MIN_FLANK_READS = 1
+        MIN_COV_ABS = 2.0
 
-        if len(exons) <= 2 or not self.bam_evidence.available:
+        if len(exons) <= 2:
             return exons
         sorted_exons = sorted(exons, key=lambda e: e.start)
         keep = [True] * len(sorted_exons)
+
         for i in range(1, len(sorted_exons) - 1):
             ex = sorted_exons[i]
             if ex.length >= MICROEXON_MAX:
                 continue
-            # Junction acceptor at exon.start (intron ends at start - 1)
-            # Junction donor    at exon.end   (intron starts at end + 1)
-            acc_reads = self.bam_evidence.reads_at_acceptor(
-                seqid, ex.start, tolerance=2)
-            don_reads = self.bam_evidence.reads_at_donor(
-                seqid, ex.end, tolerance=2)
-            if acc_reads < MIN_FLANK_READS or don_reads < MIN_FLANK_READS:
-                keep[i] = False
-                logger.debug(
-                    f"  Dropping spurious microexon {ex.start}-{ex.end} "
-                    f"({ex.length} bp): acceptor={acc_reads} reads, "
-                    f"donor={don_reads} reads (< {MIN_FLANK_READS})")
+
+            # Junction-read evidence on either flank
+            acc_reads = don_reads = 0
+            if self.bam_evidence.available:
+                acc_reads = self.bam_evidence.reads_at_acceptor(
+                    seqid, ex.start, tolerance=2)
+                don_reads = self.bam_evidence.reads_at_donor(
+                    seqid, ex.end, tolerance=2)
+                if (acc_reads >= MIN_FLANK_READS
+                        or don_reads >= MIN_FLANK_READS):
+                    continue
+
+            # Coverage evidence on the exon body
+            ex_cov = 0.0
+            if self.coverage.available:
+                ex_cov = self.coverage.get_mean_coverage(
+                    seqid, ex.start, ex.end)
+                if ex_cov >= MIN_COV_ABS:
+                    continue
+
+            # No evidence — drop.
+            keep[i] = False
+            logger.debug(
+                f"  Dropping unsupported microexon {ex.start}-{ex.end} "
+                f"({ex.length} bp): junction reads acc={acc_reads} "
+                f"don={don_reads}, coverage={ex_cov:.2f}")
         return [e for e, k in zip(sorted_exons, keep) if k]
 
     def _filter_unsupported_exons(self, seqid: str, exons: List[Feature],
