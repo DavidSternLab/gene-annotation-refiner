@@ -5357,6 +5357,14 @@ class GeneAnnotationRefiner:
             for tx in gene.transcripts:
                 # Filter tiny exons and impossible introns
                 tx.exons = [e for e in tx.exons if e.length >= MIN_EXON_SIZE]
+                # Drop spurious internal microexons (< 15 bp) that lack
+                # strong junction support on both flanks. Real microexons
+                # always have well-supported flanking junctions; predicted
+                # ones without that signature are typically alignment
+                # artifacts that bridge two real genes and prevent the
+                # split-gene logic from firing.
+                tx.exons = self._filter_spurious_microexons(
+                    gene.seqid, tx.exons, gene.strand)
                 tx.exons = filter_impossible_introns(tx.exons)
                 # Merge neighboring exons with continuous RNA-seq coverage
                 if self.coverage.available:
@@ -5920,6 +5928,47 @@ class GeneAnnotationRefiner:
         tx.start = keep_lo
         tx.end = keep_hi
         return tx
+
+    def _filter_spurious_microexons(self, seqid: str, exons: List[Feature],
+                                       strand: str) -> List[Feature]:
+        """Drop internal exons shorter than MICROEXON_MAX (15 bp) that
+        lack strong junction support on both flanks.
+
+        Real microexons exist (some as short as 3 bp) but they always
+        have substantial canonical-junction support on both the
+        acceptor and donor side; that signature is what makes them
+        confidently callable. Predicted microexons without it are
+        typically alignment artifacts that act as spurious "bridges"
+        between two real genes and prevent the split-gene logic from
+        firing.
+
+        Terminal (first/last) exons are exempt -- they're not internal
+        microexons in the splicing sense.
+        """
+        MICROEXON_MAX = 15
+        MIN_FLANK_READS = 3
+
+        if len(exons) <= 2 or not self.bam_evidence.available:
+            return exons
+        sorted_exons = sorted(exons, key=lambda e: e.start)
+        keep = [True] * len(sorted_exons)
+        for i in range(1, len(sorted_exons) - 1):
+            ex = sorted_exons[i]
+            if ex.length >= MICROEXON_MAX:
+                continue
+            # Junction acceptor at exon.start (intron ends at start - 1)
+            # Junction donor    at exon.end   (intron starts at end + 1)
+            acc_reads = self.bam_evidence.reads_at_acceptor(
+                seqid, ex.start, tolerance=2)
+            don_reads = self.bam_evidence.reads_at_donor(
+                seqid, ex.end, tolerance=2)
+            if acc_reads < MIN_FLANK_READS or don_reads < MIN_FLANK_READS:
+                keep[i] = False
+                logger.debug(
+                    f"  Dropping spurious microexon {ex.start}-{ex.end} "
+                    f"({ex.length} bp): acceptor={acc_reads} reads, "
+                    f"donor={don_reads} reads (< {MIN_FLANK_READS})")
+        return [e for e, k in zip(sorted_exons, keep) if k]
 
     def _filter_unsupported_exons(self, seqid: str, exons: List[Feature],
                                     strand: str) -> List[Feature]:
@@ -7638,13 +7687,26 @@ class GeneAnnotationRefiner:
             TERMINAL_EXTREME_COV_RATIO = 0.01  # even with junctions, drop if < 1%
 
             def _low_confidence_terminal(terminal_exon, anchor_exon, intron_reads):
-                """Return True if the terminal exon looks like a rare minor isoform."""
-                if intron_reads < 1:
-                    return True
+                """Return True if the terminal exon looks like a rare minor isoform.
+
+                Junction-only support is necessary but not sufficient to
+                drop. Real 5' UTR exons can have legitimate splice sites
+                that portcullis misses (low coverage in that intron, the
+                splicer filtered the junction at the reliability pass,
+                or the read library doesn't span that boundary). When
+                the EXON itself has substantial coverage, the exon is
+                real even if its splice junction looks weak.
+                """
                 t_cov = self.coverage.get_mean_coverage(
                     seqid, terminal_exon.start, terminal_exon.end)
                 a_cov = self.coverage.get_mean_coverage(
                     seqid, anchor_exon.start, anchor_exon.end)
+                # Coverage rescue: terminal exon with >=10% of anchor's
+                # coverage is likely real even when junctions are weak.
+                if a_cov > 1.0 and t_cov >= a_cov * TERMINAL_COV_RATIO:
+                    return False
+                if intron_reads < 1:
+                    return True
                 if intron_reads < TERMINAL_MIN_READS:
                     if a_cov > 1.0 and t_cov < a_cov * TERMINAL_COV_RATIO:
                         return True
@@ -7662,8 +7724,28 @@ class GeneAnnotationRefiner:
             if gene_exons and self.bam_evidence.available:
                 _tx_order = sorted(gene_exons, key=lambda e: e.start)
 
-                # Trim from 5' end (low index on + strand)
+                # Compute the genomic CDS span from the template's CDS, so
+                # the audit never trims past an exon that overlaps it.
+                # This protects the start/stop codon and all coding exons
+                # in cases where the splicing junctions aren't recorded in
+                # the portcullis file (sequence-based predictors like
+                # Helixer can call legitimate splice sites that the read-
+                # based junction caller missed at the reliability pass).
+                template_cds_lo = template_cds_hi = None
+                if best_tx.cds:
+                    template_cds_lo = min(c.start for c in best_tx.cds)
+                    template_cds_hi = max(c.end for c in best_tx.cds)
+
+                def _exon_overlaps_cds(ex):
+                    if template_cds_lo is None:
+                        return False
+                    return (ex.end >= template_cds_lo
+                            and ex.start <= template_cds_hi)
+
+                # Trim from 5' end (low coord on + strand, high coord on -)
                 while len(_tx_order) > 1:
+                    if _exon_overlaps_cds(_tx_order[0]):
+                        break
                     _is = _tx_order[0].end + 1
                     _ie = _tx_order[1].start - 1
                     if _ie > _is:
@@ -7678,8 +7760,10 @@ class GeneAnnotationRefiner:
                             continue
                     break
 
-                # Trim from 3' end (high index)
+                # Trim from 3' end (high coord on + strand, low coord on -)
                 while len(_tx_order) > 1:
+                    if _exon_overlaps_cds(_tx_order[-1]):
+                        break
                     _is = _tx_order[-2].end + 1
                     _ie = _tx_order[-1].start - 1
                     if _ie > _is:
