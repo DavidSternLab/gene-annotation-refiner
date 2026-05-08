@@ -2982,16 +2982,23 @@ class StrandedCoverage:
         # and reopen as a CoverageAccess group after detection.
 
     def detect_orientations(self, helixer_genes=None, td_genes=None,
-                              st_genes=None, n_sample=200, min_cds_len=300):
+                              st_genes=None, top_n=100, min_cds_len=150):
         """Determine each bigwig's strand content empirically.
 
-        Samples up to ``n_sample`` predicted-gene CDS bodies (half +
-        strand, half − strand, each ≥ min_cds_len bp, multi-exon
-        preferred) from the supplied input gene sets. For each bigwig,
-        compares mean signal at + and − strand bodies; the strand with
-        the higher mean is the bucket assigned to the file. Files where
-        both means are tiny or roughly equal are flagged ambiguous and
-        skipped.
+        Collects ALL predicted-gene CDS bodies (>= min_cds_len, multi-
+        exon preferred) from the supplied input gene sets, then for
+        each bigwig file picks the top_n best-signal candidates per
+        strand (rather than sampling positionally). This avoids
+        situations where the first N candidate regions happen to land
+        on chromosomes the bigwig doesn't cover or in low-expression
+        regions, which previously made well-formed bigwigs look like
+        all-zero signal and caused them to be discarded.
+
+        For each bigwig, compares mean signal at the top + strand vs
+        top − strand bodies; the strand with the higher mean is the
+        bucket assigned. Files where neither strand resolves with
+        clear signal are flagged ambiguous and skipped, with an
+        explicit hint about possible seqid mismatch.
         """
         import pyBigWig
         if not self._all_paths:
@@ -3017,10 +3024,6 @@ class StrandedCoverage:
                     plus_regions.append((g.seqid, cds_lo, cds_hi))
                 else:
                     minus_regions.append((g.seqid, cds_lo, cds_hi))
-        # Cap each side to n_sample/2
-        half = max(20, n_sample // 2)
-        plus_regions = plus_regions[:half]
-        minus_regions = minus_regions[:half]
         if len(plus_regions) < 3 or len(minus_regions) < 3:
             logger.warning("StrandedCoverage: too few sample CDS bodies "
                            f"(+={len(plus_regions)}, -={len(minus_regions)}) "
@@ -3032,9 +3035,10 @@ class StrandedCoverage:
         plus_paths, minus_paths = [], []
         ambig_paths = []
         logger.info(f"StrandedCoverage: detecting strand convention for "
-                    f"{len(self._all_paths)} bigwig file(s) using "
-                    f"{len(plus_regions)} + and {len(minus_regions)} − strand "
-                    f"sample CDS bodies...")
+                    f"{len(self._all_paths)} bigwig file(s) from "
+                    f"{len(plus_regions)} + / {len(minus_regions)} − "
+                    f"candidate CDS bodies (top {top_n} by signal each)...")
+
         for path in self._all_paths:
             try:
                 bw = pyBigWig.open(path)
@@ -3043,32 +3047,65 @@ class StrandedCoverage:
                 continue
             chroms = bw.chroms()
 
-            def mean_signal(regions):
-                vals = []
+            # Compute per-region mean signal for ALL candidates, then
+            # take top_n by signal per strand. This makes the test
+            # robust to chromosome subsets and low-expression genes.
+            def signals_for(regions):
+                out = []
+                missing_seqid = 0
                 for seqid, s, e in regions:
                     if seqid not in chroms:
+                        missing_seqid += 1
                         continue
-                    e = min(e, chroms[seqid])
-                    if e <= s:
+                    e_clip = min(e, chroms[seqid])
+                    if e_clip <= s:
                         continue
                     try:
-                        v = bw.values(seqid, s - 1, e)
+                        v = bw.values(seqid, s - 1, e_clip)
                         v = [x for x in v if x is not None and not np.isnan(x)]
                         if v:
-                            vals.append(sum(v) / len(v))
+                            out.append(sum(v) / len(v))
+                        else:
+                            out.append(0.0)
                     except Exception:
                         continue
-                return float(np.mean(vals)) if vals else 0.0
+                return out, missing_seqid
 
-            p_signal = mean_signal(plus_regions)
-            m_signal = mean_signal(minus_regions)
+            p_all, p_miss = signals_for(plus_regions)
+            m_all, m_miss = signals_for(minus_regions)
             bw.close()
 
+            # Top-N by signal magnitude per strand
+            p_top = sorted(p_all, reverse=True)[:top_n]
+            m_top = sorted(m_all, reverse=True)[:top_n]
+            p_signal = float(np.mean(p_top)) if p_top else 0.0
+            m_signal = float(np.mean(m_top)) if m_top else 0.0
+
             base = os.path.basename(path)
+            # Diagnose seqid mismatch explicitly
+            total_miss = p_miss + m_miss
+            total_query = len(plus_regions) + len(minus_regions)
+            if total_miss == total_query:
+                ambig_paths.append(path)
+                logger.warning(
+                    f"  {base}: NO chromosome match between bigwig and "
+                    f"input GFFs — input seqids not present in bigwig's "
+                    f"chrom list ({total_miss}/{total_query} regions "
+                    f"unmapped). Check that the bigwig was built from the "
+                    f"same genome assembly. Discarded.")
+                continue
+
             if max(p_signal, m_signal) < 0.5:
                 ambig_paths.append(path)
-                logger.warning(f"  {base}: too little signal "
-                               f"(+={p_signal:.2f}, −={m_signal:.2f}) — discarded")
+                # Sample a couple of seqids that DID match, for diagnostic
+                seqid_sample = list(set(s for s, _, _ in plus_regions
+                                         if s in chroms))[:3]
+                logger.warning(
+                    f"  {base}: top-{top_n} signal too low "
+                    f"(+={p_signal:.3f}, −={m_signal:.3f}). Bigwig has "
+                    f"matching chromosomes ({total_query - total_miss} "
+                    f"regions found, e.g. {seqid_sample}) but no signal "
+                    f"at predicted CDS bodies. Discarded.")
                 continue
             ratio = max(p_signal, m_signal) / max(0.01, min(p_signal, m_signal))
             if ratio < 2.0:
